@@ -1,0 +1,12 @@
+# Make the credential-free public search chain the default web-search provider:
+# Startpage first, then DuckDuckGo -> Ecosia -> Google -> Mojeek as sequential
+# fallbacks. The chain needs no API key and no fetch provider. The keyed DeepSeek
+# route (web-search-deepseek) is left untouched, so deployments that explicitly
+# choose their own provider via `web.searchProvider` keep that choice.
+- id: web
+  config:
+    searchProvider: public
+
+- insert:
+    - id: web-search-public
+      name: '@hy-sde-org/dsh-web-search-public'

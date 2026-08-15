@@ -1,0 +1,88 @@
+{
+  "name": "@hy-sde-org/dsh-web-search-public",
+  "version": "0.1.0-rc.6",
+  "description": "Credential-free sequential web search chain for DeepSeek Harness (Startpage -> DuckDuckGo -> Ecosia -> Google -> Mojeek)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./invariant": {
+      "types": "./dist/invariant.d.ts",
+      "default": "./dist/invariant.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "THIRD-PARTY-NOTICES.md",
+    "docs",
+    "scripts/release-public.sh"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist coverage",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:real": "vitest run --config vitest.real.config.ts",
+    "lint:package": "publint",
+    "release:check": "bash scripts/release-public.sh --check",
+    "release:publish": "bash scripts/release-public.sh --publish",
+    "prepack": "npm run clean && npm run build"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hy-sde/dsh-web-search-public.git"
+  },
+  "homepage": "https://github.com/hy-sde/dsh-web-search-public#readme",
+  "bugs": {
+    "url": "https://github.com/hy-sde/dsh-web-search-public/issues"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek",
+    "agent",
+    "harness",
+    "dsh-plugin",
+    "web-search",
+    "search"
+  ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-web": "^0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-invariants": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-web": "0.1.0-rc.6",
+    "@types/node": "24.12.4",
+    "publint": "0.3.21",
+    "tsx": "4.22.1",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  }
+}
