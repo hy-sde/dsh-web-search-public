@@ -31,13 +31,13 @@ failing.
 ## Prerequisites
 
 - Node.js 22.19 or newer with npm and pnpm on `PATH`;
-- DeepSeek Harness `0.1.0-rc.6` including the standard `dsh` CLI;
+- DeepSeek Harness `0.1.0-rc.7` including the standard `dsh` CLI;
 - no API keys — nothing else.
 
 Install the Harness CLI and pnpm before continuing:
 
 ```bash
-npm install --global @deepseek-ai/dsh@0.1.0-rc.6 pnpm
+npm install --global @deepseek-ai/dsh@0.1.0-rc.7 pnpm
 dsh --version
 ```
 
@@ -185,7 +185,7 @@ Search failures use the web seam’s `WEB_*` codes:
 | Component | Supported contract |
 | --- | --- |
 | Node.js | 22.19 or newer |
-| DeepSeek Harness | `0.1.0-rc.6` (`@deepseek-ai/dsh-web`, `@deepseek-ai/cordis` peer range) |
+| DeepSeek Harness | `0.1.0-rc.7` (`@deepseek-ai/dsh-web`, `@deepseek-ai/cordis` peer range) |
 | Seam | `ctx.web` `WebSearchProvider` (no key, no fetch provider) |
 
 DeepSeek Harness is a developer preview. Upstream seam-contract changes require a new
