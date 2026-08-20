@@ -1,13 +1,21 @@
 # Operations notes
 
-Runtime behavior, expectations, and troubleshooting for the credential-free search chain.
+Runtime behavior, expectations, and troubleshooting for the credential-free search fan-out.
 
 ## Worst-case latency
 
-The chain’s worst case is `engines.length × timeoutMs` (default `5 × 10 s`). `dsh-tool-web`
-books a 60-second search budget in the shipped harness bundle, which covers the default
-worst case. If you raise `timeoutMs` or lengthen the engine list, give `tool-web` a matching
-`searchTimeoutMs` in your profile patch.
+Each search contacts every configured engine in parallel and is bounded by two aggregate
+deadlines: `softDeadlineMs` (default 5 s) and `hardDeadlineMs` (default 30 s). The call
+returns at the earliest of: all engines settled, the soft deadline with at least one success
+in hand, or the hard deadline regardless — then aborts still-running engines. The worst
+case is therefore ≈ `hardDeadlineMs` (30 s default), well under the 60-second search budget
+`dsh-tool-web` books in the shipped harness bundle. If you raise `hardDeadlineMs` toward or
+past 60 s, give `tool-web` a matching `searchTimeoutMs` in your profile patch.
+
+A note on the soft deadline: the aggregate deliberately waits for stragglers up to
+`softDeadlineMs` to enrich consensus, so even when one engine answers instantly, a slower
+engine can hold the call to the soft window. Lower `softDeadlineMs` for lower latency at the
+cost of thinner consensus.
 
 ## Engine expectations (July-2026 baseline)
 
@@ -32,26 +40,31 @@ change and record what you observed.
 - Accept: `text/html, application/xhtml+xml, text/plain;q=0.9, */*;q=0.5`, plus an
   accept-language header.
 - Redirects: rejected (`redirect: "error"`).
-- Each engine request is one independent HTTP round; there is no shared session, cookie jar,
-  or IP pooling beyond what the platform itself provides.
+- Fan-out: **all configured engines are contacted per query** (up to 5 concurrent anonymous
+  requests, plus Startpage’s two-request handshake). There is no shared session, cookie jar,
+  or IP pooling beyond what the platform itself provides. Expect higher bot-challenge /
+  rate-limit pressure on the engine hosts than a single-engine chain would produce.
 
 ## When results look wrong
 
 1. **All engines failed** → the tool returns `WEB_PROVIDER_ERROR` with a `id: reason; …`
    message. Reasons are `ok-but-empty` (challenged or no organic results), `timed out`,
    `HTTP <status>`, or a transport error.
-2. **One engine is flaky** → the chain simply skips it. Check that engine’s markup against
-   its parser with the real test.
-3. **Want a different order** → set `engines` in the plugin config (see README). Engines not
-   listed are not tried.
-4. **Want the DeepSeek route** → keep this bundle installed for the fallback and set
+2. **One engine is flaky** → the fan-out absorbs it: its empty/challenged answers simply do
+   not contribute to the consensus merge. Check that engine’s markup against its parser with
+   the real test.
+3. **Want a different engine set or order** → set `engines` in the plugin config (see
+   README). Engines not listed are never queried.
+4. **Want tighter latency / less amplification** → lower `softDeadlineMs`, shorten the
+   `engines` list, or both; the consensus becomes thinner and the merge cheaper.
+5. **Want the DeepSeek route** → keep this bundle installed for the fallback and set
    `web.searchProvider: deepseek-official` plus the `DEEPSEEK_API_KEY` credential.
 
 ## Privacy hygiene
 
-- Queries go to public engines verbatim — never search with secrets or PII.
+- Queries go to public engines verbatim and, because of the fan-out, to several of them at
+  once — never search with secrets or PII.
 - No key material, no tokens, and no cookies are ever sent; the only per-request data is the
   query, the fixed headers, and your source IP.
 - If your deployment must not disclose a query to third parties, do not use this provider —
   use a keyed provider (e.g. `deepseek-official`) whose retrieval stays inside its own API.
-

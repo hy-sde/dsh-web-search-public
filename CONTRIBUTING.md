@@ -72,17 +72,19 @@ dsh web --dump-config
 
 ## Design constraints
 
-- Keep the chain credential-free. Never add an API-key path, even as a fallback.
-- Keep engines strictly sequential and fail-forward: zero results, a timed-out engine, and a
-  failed request all advance to the next engine; only an all-engine failure may throw.
+- Keep the provider credential-free. Never add an API-key path, even as a fallback.
+- Keep the fan-out concurrent and consensus-ranked (a faithful port of oh-my-pi
+  `searchPublicWeb`): zero results, a timed-out engine, and a failed request are absorbed by
+  the merge; only an all-engine failure may throw, and the call is always bounded by the
+  soft/hard deadline pair.
 - Keep every engine secret-free and header-lean: the browser-shaped `userAgent` constant and
   an `accept` header, nothing more.
 - Keep parsers tolerant: a challenged or redesigned page must parse to zero organic results,
-  never throw into the chain.
+  never throw into the merge.
 - Keep tests fixture-based; the live suite is opt-in (`DSH_WEB_SEARCH_REAL_E2E=1`).
 - Preserve the web seam contracts: providers return fully-formed `WebSearchSource[]` and the
   consumer sets `truncated`; never mark results truncated yourself.
 - Preserve `redirect: "error"` on every engine fetch.
-- Preserve the oh-my-pi attribution and its MIT notice ([THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)) whenever engine code is changed or extended.
+- Preserve the oh-my-pi attribution and its MIT notice ([THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)) whenever engine or provider code is changed or extended.
 
 Changes to these constraints require updating this file and [docs/operations.md](docs/operations.md).

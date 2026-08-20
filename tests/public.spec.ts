@@ -1,7 +1,9 @@
 /**
- * Provider-level tests: chain semantics (first-success, advance on failure /
- * zero results / timeout), aggregate failure, abort handling, availability,
- * and a full plugin boot against a stubbed fetch.
+ * Provider-level tests: fan-out semantics (all engines queried concurrently,
+ * consensus merge with engine-order tiebreak), deadline behavior (return at
+ * soft deadline with success, wait past soft for the first success, hard cap
+ * with zero successes), straggler abort, aggregate failure, abort handling,
+ * availability, and a full plugin boot against a stubbed fetch.
  * @module @hy-sde-org/dsh-web-search-public/tests/public
  */
 
@@ -62,8 +64,10 @@ function stubEngine(id: PublicEngineId, options: StubOptions = {}): { engine: Pu
   return { engine, calls }
 }
 
-function provider(engines: PublicEngine[], timeoutMs = 10_000): PublicSearchProvider {
-  return new PublicSearchProvider({ engines, timeoutMs })
+type ProviderOverrides = Partial<{ timeoutMs: number; softDeadlineMs: number; hardDeadlineMs: number }>
+
+function provider(engines: PublicEngine[], overrides: ProviderOverrides = {}): PublicSearchProvider {
+  return new PublicSearchProvider({ engines, timeoutMs: 10_000, softDeadlineMs: 5_000, hardDeadlineMs: 30_000, ...overrides })
 }
 
 afterEach(() => {
@@ -77,40 +81,99 @@ describe('PublicSearchProvider', () => {
     expect(provider([]).available()).toBe(false)
   })
 
-  it('returns the first engine with results and stops there', async () => {
+  it('fans out to every engine and returns the consensus merge', async () => {
+    const startpage = stubEngine('startpage', {
+      sources: [
+        { url: 'https://example.com/shared', title: 'Shared (startpage)', snippet: 'short' },
+        { url: 'https://a.example/one', title: 'Alpha', snippet: 'alpha snippet' },
+      ],
+    })
+    const ddg = stubEngine('duckduckgo', {
+      sources: [
+        { url: 'https://www.example.com/shared/', title: 'Shared (ddg)', snippet: 'a much longer consolidated snippet' },
+        { url: 'https://c.example/three', title: 'Gamma', snippet: 'gamma snippet' },
+      ],
+    })
+    const result = await provider([startpage.engine, ddg.engine]).search({ query: 'q', maxResults: 3 })
+
+    // Both engines were queried concurrently.
+    expect(startpage.calls).toHaveLength(1)
+    expect(ddg.calls).toHaveLength(1)
+    expect(result).toEqual({
+      sources: [
+        // Two-engine consensus outranks single-engine results; the
+        // www/trailing-slash variant merges. Startpage is earlier in the order,
+        // so it wins the equal-rank title/url tie; the longer snippet wins.
+        { url: 'https://example.com/shared', title: 'Shared (startpage)', snippet: 'a much longer consolidated snippet' },
+        // Rank-1 single-engine results tie; the earlier engine's insertion
+        // order wins.
+        { url: 'https://a.example/one', title: 'Alpha', snippet: 'alpha snippet' },
+        { url: 'https://c.example/three', title: 'Gamma', snippet: 'gamma snippet' },
+      ],
+      truncated: false,
+    })
+  })
+
+  it('keeps each engine result when engines do not overlap and caps to maxResults', async () => {
     const first = stubEngine('startpage', { sources: [{ url: 'https://s.test/1', title: 'S One' }] })
-    const second = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/1' }] })
-    const result = await provider([first.engine, second.engine]).search({ query: 'q', maxResults: 3 })
-    expect(result).toEqual({ sources: [{ url: 'https://s.test/1', title: 'S One' }], truncated: false })
-    expect(first.calls).toHaveLength(1)
-    expect(second.calls).toHaveLength(0)
+    const second = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/2', title: 'D Two' }] })
+    const result = await provider([first.engine, second.engine]).search({ query: 'q', maxResults: 1 })
+    // No consensus anywhere: ties break on best rank then engine order, and the
+    // provider caps the merged list to maxResults before returning.
+    expect(result.sources).toEqual([{ url: 'https://s.test/1', title: 'S One' }])
   })
 
-  it('advances on empty results', async () => {
-    const first = stubEngine('startpage', { sources: [] })
-    const second = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/2' }] })
-    const result = await provider([first.engine, second.engine]).search({ query: 'q' })
-    expect(result.sources).toEqual([{ url: 'https://d.test/2' }])
+  it('tolerates individual engine failures and returns the surviving results', async () => {
+    const blocked = stubEngine('startpage', { error: new Error('HTTP 403') })
+    const healthy = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/3', title: 'Alpha' }] })
+    const result = await provider([blocked.engine, healthy.engine]).search({ query: 'q' })
+    expect(result.sources).toEqual([{ url: 'https://d.test/3', title: 'Alpha' }])
   })
 
-  it('advances on engine failure', async () => {
-    const first = stubEngine('startpage', { error: new Error('HTTP 403') })
-    const second = stubEngine('google', { sources: [{ url: 'https://g.test/3' }] })
-    const result = await provider([first.engine, second.engine]).search({ query: 'q' })
-    expect(result.sources).toEqual([{ url: 'https://g.test/3' }])
+  it('waits past the soft deadline for the first success instead of returning empty', async () => {
+    const slow = stubEngine('startpage', { sources: [{ url: 'https://s.test/1' }], delayMs: 60 })
+    const empty = stubEngine('duckduckgo', { sources: [] })
+    const result = await provider([slow.engine, empty.engine], { softDeadlineMs: 10, hardDeadlineMs: 200 }).search({ query: 'q' })
+    expect(result.sources).toEqual([{ url: 'https://s.test/1' }])
   })
 
-  it('advances on per-engine timeout even when the engine ignores the signal', async () => {
-    const hanging = stubEngine('ecosia', { sources: [{ url: 'https://e.test/x' }], delayMs: 400 })
-    const fallback = stubEngine('mojeek', { sources: [{ url: 'https://m.test/4' }] })
+  it('returns at the soft deadline with delivered results and aborts stragglers', async () => {
+    const quick = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/4' }] })
+    let stragglerAborted = false
+    const hanging: PublicEngine = {
+      id: 'startpage',
+      async search(_request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => { resolve() }, 1000)
+          signal?.addEventListener('abort', () => { stragglerAborted = true; clearTimeout(timer); resolve() }, { once: true })
+        })
+        return []
+      },
+    }
     const start = Date.now()
-    const result = await provider([hanging.engine, fallback.engine], 60).search({ query: 'q' })
+    const result = await provider([hanging, quick.engine], { softDeadlineMs: 50, hardDeadlineMs: 1000 }).search({ query: 'q' })
     const elapsed = Date.now() - start
-    expect(elapsed).toBeLessThan(350)
-    expect(result.sources).toEqual([{ url: 'https://m.test/4' }])
+    expect(elapsed).toBeLessThan(500)
+    expect(result.sources).toEqual([{ url: 'https://d.test/4' }])
+    expect(stragglerAborted).toBe(true)
   })
 
-  it('aggregates failures into a WEB_PROVIDER_ERROR', async () => {
+  it('returns whatever it has at the hard deadline even with zero successes', async () => {
+    const empty = stubEngine('duckduckgo', { sources: [] })
+    const hanging: PublicEngine = {
+      id: 'startpage',
+      async search(): Promise<WebSearchSource[]> {
+        return new Promise(() => {}) // never settles, ignores abort
+      },
+    }
+    const result = await provider([hanging, empty.engine], { softDeadlineMs: 10, hardDeadlineMs: 40 }).search({ query: 'q' })
+    // Only `empty` settled with no results — not all engines failed (one is
+    // still in flight), so the aggregate returns what it has rather than
+    // throwing.
+    expect(result.sources).toEqual([])
+  })
+
+  it('aggregates failures into a WEB_PROVIDER_ERROR when every engine fails', async () => {
     const first = stubEngine('startpage', { error: new Error('HTTP 403') })
     const second = stubEngine('mojeek', { sources: [] })
     const result = provider([first.engine, second.engine]).search({ query: 'q' })
@@ -134,7 +197,7 @@ describe('PublicSearchProvider', () => {
     )).rejects.toMatchObject({ code: 'WEB_ABORTED' })
   })
 
-  it('propagates WEB_ABORTED when the caller aborts mid-chain', async () => {
+  it('propagates WEB_ABORTED when the caller aborts mid-flight', async () => {
     const slow = stubEngine('startpage', { sources: [{ url: 'https://s.test/1' }], delayMs: 100 })
     const controller = new AbortController()
     const pending = provider([slow.engine, stubEngine('mojeek', { sources: [{ url: 'https://m.test/6' }] }).engine])
@@ -148,6 +211,8 @@ describe('PublicSearchProvider', () => {
 describe('plugin boot', () => {
   // Per-URL routing: Startpage's homepage/serp and DuckDuckGo's html endpoint
   // each answer with their own fixture; anything else fails the test loudly.
+  // The fan-out queries every engine, so non-startpage hosts must still answer
+  // predictably or be tolerated as engine failures.
   function routerFixture(): ReturnType<typeof vi.fn> {
     return vi.fn(async (input: unknown) => {
       const url = String((input as { url?: string }).url ?? input)
@@ -158,6 +223,9 @@ describe('plugin boot', () => {
         body = startpageHome
       } else if (url.includes('html.duckduckgo.com')) {
         body = ddgPage
+      } else if (url.includes('ecosia.org') || url.includes('google.com') || url.includes('mojeek.com')) {
+        // Bot-challenged pages parse to zero results; the fan-out tolerates them.
+        body = '<html><body>empty</body></html>'
       } else {
         throw new Error(`unexpected fetch: ${url}`)
       }
@@ -169,28 +237,28 @@ describe('plugin boot', () => {
     expect('default' in publicPlugin).toBe(false)
   })
 
-  it('registers the public provider and searches through ctx.web via the first engine', async () => {
+  it('registers the public provider and searches through ctx.web via the fan-out', async () => {
     const fetchMock = routerFixture()
     vi.stubGlobal('fetch', fetchMock)
 
     const ctx = new Context()
     await ctx.plugin(WebRuntime, { searchProvider: PUBLIC_PROVIDER_ID })
-    const fiber = await ctx.plugin(publicPlugin, { timeoutMs: 1000 })
+    const fiber = await ctx.plugin(publicPlugin, { softDeadlineMs: 500 })
     const result = await ctx.web.search({ query: 'example', maxResults: 5 })
 
     expect(result.truncated).toBe(false)
-    expect(result.sources).toHaveLength(2)
+    // The fan-out merged Startpage's 2 results with DuckDuckGo's 2 (no URL
+    // overlap, so all tie at rank 0 and engine order wins).
+    expect(result.sources).toHaveLength(4)
+    // Startpage answered (homepage handshake + POST search). DuckDuckGo was
+    // queried too — every engine is fanned out in parallel.
+    expect(fetchMock.mock.calls.some(call => String(call[0]).includes('startpage.com/sp/search'))).toBe(true)
+    expect(fetchMock.mock.calls.some(call => String(call[0]).includes('html.duckduckgo.com'))).toBe(true)
     expect(result.sources[0]).toMatchObject({
       url: 'https://startpage.test/a',
       title: 'Startpage A',
       snippet: 'First description here.',
     })
-    // Startpage is first: homepage (hidden fields) + POST search, then stop —
-    // never DuckDuckGo or later engines.
-    expect(fetchMock).toHaveBeenCalledTimes(2)
-    for (const call of fetchMock.mock.calls) {
-      expect(String(call[0])).toContain('startpage.com')
-    }
     await fiber.dispose()
   })
 
@@ -201,10 +269,11 @@ describe('plugin boot', () => {
 
     const ctx = new Context()
     await ctx.plugin(WebRuntime, { searchProvider: PUBLIC_PROVIDER_ID })
-    const fiber = await ctx.plugin(publicPlugin)
+    const fiber = await ctx.plugin(publicPlugin, { softDeadlineMs: 500 })
     const result = await ctx.web.search({ query: 'example', maxResults: 2 })
     expect(result.sources.length).toBeGreaterThan(0)
-    expect(String(fetchMock.mock.calls[0]![0])).toContain('startpage.com')
+    // The public provider was selected, so Startpage was contacted.
+    expect(fetchMock.mock.calls.some(call => String(call[0]).includes('startpage.com'))).toBe(true)
     await fiber.dispose()
     delete process.env.DSH_WEB_SEARCH_PROVIDER
   })

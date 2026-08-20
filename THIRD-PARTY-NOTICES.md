@@ -11,8 +11,9 @@ chain and per-engine scrapers originally at:
 - `packages/coding-agent/src/web/search/providers/google.ts`
 - `packages/coding-agent/src/web/search/providers/mojeek.ts`
 
-The ported portions are adapted to the DeepSeek Harness `ctx.web` seam with sequential
-fail-forward semantics (Startpage first, then DuckDuckGo → Ecosia → Google → Mojeek).
+The ported portions are adapted to the DeepSeek Harness `ctx.web` seam; the provider is a
+faithful port of oh-my-pi’s parallel `searchPublicWeb` aggregate (fan-out with soft/hard
+deadlines, cross-engine consensus merge — Startpage, DuckDuckGo, Ecosia, Google, Mojeek).
 
 oh-my-pi is distributed under the following MIT License:
 
