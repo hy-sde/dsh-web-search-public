@@ -1,0 +1,13 @@
+# Make the credential-free public search fan-out the default web-search provider:
+# one query fans out to all engines concurrently (Startpage, DuckDuckGo, Ecosia,
+# Google, Mojeek) and the answers are merged by cross-engine consensus, bounded by
+# soft/hard deadlines. It needs no API key and no fetch provider. The keyed
+# DeepSeek route (web-search-deepseek) is left untouched, so deployments that
+# explicitly choose their own provider via `web.searchProvider` keep that choice.
+- id: web
+  config:
+    searchProvider: public
+
+- insert:
+    - id: web-search-public
+      name: '@hy-sde-org/dsh-web-search-public'
