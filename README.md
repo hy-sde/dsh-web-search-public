@@ -52,10 +52,10 @@ dsh plugin --profile web add @hy-sde-org/dsh-web-search-public
 ### Route B — from source (validate this checkout or hack on the plugin)
 
 ```bash
-git clone <this-repository-url> dsh-web-search-public
-cd dsh-web-search-public
-npm ci
-PACKAGE_TARBALL="$(npm pack --silent)"
+git clone git@github.com:hy-sde/dsh-plugins.git
+cd dsh-plugins
+pnpm install
+PACKAGE_TARBALL="$(pnpm pack --silent)"
 dsh plugin --profile web add "$PWD/$PACKAGE_TARBALL"
 cd ..
 ```
