@@ -130,13 +130,16 @@ fetch arbitrary URLs, which defers SSRF exposure entirely.
   equal-rank ties.
 - Each engine still runs under its own `AbortSignal.timeout(timeoutMs)` race, so an engine
   that ignores the aggregate’s cancellation dies at its own cap.
-- **Rate-limit resilience is best-effort.** When every engine fails with a transport
-  signature (HTTP 4xx/5xx or timeout — the rate-limit pattern), the provider retries the
-  whole fan-out after an exponential backoff (`maxRetries`/`retryDelayMs`, abort-aware sleep)
-  and, once retries are exhausted, fast-fails for `failureCooldownMs` with a
-  `retry in about Ns` error instead of re-blasting engines that just throttled us (which
-  would deepen the block). A pure all-`no results` aggregate is query-level and is never
-  retried or cooled down.
+- **Rate-limit resilience is best-effort, layered.** A hard block (HTTP 4xx) or
+  a zero-result page repeated on consecutive searches opens *that engine’s* circuit breaker:
+  it is skipped for `engineBackoffMs` (5 min default, doubling per consecutive trip up to
+  `maxEngineBackoffMs`), with no request sent, and probed again after the window. Retryable
+  transport failures (HTTP 5xx, timeout, network fetch failure) retry the whole fan-out after
+  an exponential backoff (`maxRetries`/`retryDelayMs`, abort-aware sleep); hard blocks are
+  never retried. Once retries are exhausted — or every engine is down — the provider
+  fast-fails for `failureCooldownMs` (5 min default) with a `retry in about Ns` error instead
+  of re-blasting engines that just throttled us (which would deepen the block). A pure
+  all-`no results` aggregate is query-level and is never retried or cooled down.
 
 - `available()` is `true` whenever at least one engine is configured — the provider is always
   usable, which is the point.
@@ -159,9 +162,11 @@ All options are optional; constants fill the defaults. Configure via the plugin 
 | `timeoutMs` | `10000` | per-engine transport timeout; bounds one engine even if it ignores aggregate cancellation |
 | `softDeadlineMs` | `5000` | soft aggregate deadline — return as soon as all engines settled or this passes with ≥1 success |
 | `hardDeadlineMs` | `30000` | hard aggregate deadline — return whatever we have, even nothing; must be ≥ `softDeadlineMs` |
-| `maxRetries` | `1` | retries for the all-engines-failed aggregate when at least one engine died from a transport failure (HTTP 4xx/5xx or a timeout) — the rate-limit signature. Each retry re-runs the whole fan-out after a backoff, so a short engine throttle that strips the first attempt still yields results. `0` disables retrying. A pure all-`no results` aggregate is query-level and never retried. |
+| `maxRetries` | `1` | retries for the all-engines-failed aggregate when at least one engine died from a *retryable* transport failure (HTTP 5xx, a timeout, or a network fetch failure). Each retry re-runs the whole fan-out after a backoff, so a short engine throttle that strips the first attempt still yields results. `0` disables retrying. Hard blocks (HTTP 4xx) are never retried — they open that engine’s circuit breaker — and a pure all-`no results` aggregate is query-level and never retried. |
 | `retryDelayMs` | `2000` | base delay before retry #1 (ms); doubles on each subsequent attempt. |
-| `failureCooldownMs` | `30000` | fast-fail window (ms) after a retry-exhausted rate-limit failure: searches in this window return a clear `retry in about Ns` error instead of re-blasting engines that just throttled us (which would deepen the block). `0` disables the window. |
+| `failureCooldownMs` | `300000` | fast-fail window (ms) after an all-engines-down failure (retry exhausted, or every engine hard-blocked/tripped): searches in this window return a clear `retry in about Ns` error instead of re-blasting engines that just throttled us (which would deepen the block). `0` disables the window. |
+| `engineBackoffMs` | `300000` | base per-engine circuit-breaker window (ms): an engine that hard-blocks (HTTP 4xx) or returns no results on consecutive searches is skipped for this long instead of being re-blasted on every search. Doubles per consecutive trip up to `maxEngineBackoffMs`; resets after a successful probe. `0` disables the per-engine breaker. |
+| `maxEngineBackoffMs` | `3600000` | cap for the doubled per-engine circuit-breaker window (ms). |
 | `userAgent` | browser-shaped constant | User-Agent sent to the engines (deliberately not the product UA) |
 
 ```yaml
@@ -174,7 +179,9 @@ All options are optional; constants fill the defaults. Configure via the plugin 
     hardDeadlineMs: 25000
     maxRetries: 1
     retryDelayMs: 2000
-    failureCooldownMs: 30000
+    failureCooldownMs: 300000
+    engineBackoffMs: 300000
+    maxEngineBackoffMs: 3600000
 ```
 
 `PublicEngineId` values are the exported engine ids; any id outside the known set is dropped

@@ -12,10 +12,12 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type {} from '@deepseek-ai/dsh-web'
+import type { } from '@deepseek-ai/dsh-web'
 import { createEngines } from './engines/index.ts'
 import {
+  DEFAULT_ENGINE_BACKOFF_MS,
   DEFAULT_FAILURE_COOLDOWN_MS,
+  DEFAULT_MAX_ENGINE_BACKOFF_MS,
   DEFAULT_MAX_RETRIES,
   DEFAULT_RETRY_DELAY_MS,
   HARD_DEADLINE_MS,
@@ -33,7 +35,9 @@ import {
 export { PUBLIC_PROVIDER_ID, dedupKey, mergeSources, PublicSearchProvider } from './provider.ts'
 export type { PublicSearchProviderOptions, MergedSource } from './provider.ts'
 export {
+  DEFAULT_ENGINE_BACKOFF_MS,
   DEFAULT_FAILURE_COOLDOWN_MS,
+  DEFAULT_MAX_ENGINE_BACKOFF_MS,
   DEFAULT_MAX_RETRIES,
   DEFAULT_RETRY_DELAY_MS,
   HARD_DEADLINE_MS,
@@ -69,20 +73,32 @@ export interface Config {
   hardDeadlineMs?: number
   /**
    * Retries for the all-engines-failed aggregate when at least one engine died
-   * from a transport failure (HTTP 4xx/5xx or a timeout) — the rate-limit
-   * signature. Each retry re-runs the whole fan-out after a backoff, so a short
-   * engine throttle that strips the first attempt still yields results.
+   * from a retryable transport failure (HTTP 5xx, timeout, network failure).
+   * Each retry re-runs the whole fan-out after a backoff, so a short engine
+   * throttle that strips the first attempt still yields results. Hard blocks
+   * (HTTP 4xx) are never retried — they open the per-engine breaker instead.
    * Default: 1. 0 disables.
    */
   maxRetries?: number
   /** Base delay before retry #1 (ms), doubled per attempt. Default: 2000. */
   retryDelayMs?: number
   /**
-   * Fast-fail window (ms) after a retry-exhausted rate-limit failure: searches
-   * in this window return a "retry in about Ns" error instead of re-blasting
-   * engines that just throttled us. Default: 30000. 0 disables.
+   * Fast-fail window (ms) after a retry-exhausted / all-engines-down failure:
+   * searches in this window return a "retry in about Ns" error instead of
+   * re-blasting engines that just throttled us. Default: 300000 (5 min).
+   * 0 disables.
    */
   failureCooldownMs?: number
+  /**
+   * Base per-engine circuit-breaker window (ms): an engine that hard-blocks
+   * (HTTP 4xx) or returns no results repeatedly is skipped for this long
+   * instead of being re-blasted on every search. Doubles per consecutive trip
+   * up to maxEngineBackoffMs; resets after a successful probe. Default: 300000
+   * (5 min). 0 disables the per-engine breaker.
+   */
+  engineBackoffMs?: number
+  /** Cap for the doubled per-engine circuit-breaker window. Default: 3600000 (1h). */
+  maxEngineBackoffMs?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -94,6 +110,8 @@ export const Config: z<Config> = z.object({
   maxRetries: z.number().step(1).min(0).default(DEFAULT_MAX_RETRIES),
   retryDelayMs: z.number().step(1).min(1).default(DEFAULT_RETRY_DELAY_MS),
   failureCooldownMs: z.number().step(1).min(0).default(DEFAULT_FAILURE_COOLDOWN_MS),
+  engineBackoffMs: z.number().step(1).min(0).default(DEFAULT_ENGINE_BACKOFF_MS),
+  maxEngineBackoffMs: z.number().step(1).min(0).default(DEFAULT_MAX_ENGINE_BACKOFF_MS),
 })
 
 /** Configured timeout and deadlines must be positive integers; hard must not precede soft. */
@@ -138,14 +156,25 @@ export function apply(ctx: Context, config: Config): void {
   const failureCooldownMs = config.failureCooldownMs !== undefined
     ? config.failureCooldownMs
     : DEFAULT_FAILURE_COOLDOWN_MS
+  const engineBackoffMs = config.engineBackoffMs !== undefined
+    ? config.engineBackoffMs
+    : DEFAULT_ENGINE_BACKOFF_MS
+  const maxEngineBackoffMs = config.maxEngineBackoffMs !== undefined
+    ? config.maxEngineBackoffMs
+    : DEFAULT_MAX_ENGINE_BACKOFF_MS
   assertPositiveInteger('timeoutMs', timeoutMs)
   assertPositiveInteger('softDeadlineMs', softDeadlineMs)
   assertPositiveInteger('hardDeadlineMs', hardDeadlineMs)
   assertNonNegativeInteger('maxRetries', maxRetries)
   assertPositiveInteger('retryDelayMs', retryDelayMs)
   assertNonNegativeInteger('failureCooldownMs', failureCooldownMs)
+  assertNonNegativeInteger('engineBackoffMs', engineBackoffMs)
+  assertNonNegativeInteger('maxEngineBackoffMs', maxEngineBackoffMs)
   if (hardDeadlineMs < softDeadlineMs) {
     throw new Error('web-search-public: hardDeadlineMs must be >= softDeadlineMs')
+  }
+  if (maxEngineBackoffMs < engineBackoffMs) {
+    throw new Error('web-search-public: maxEngineBackoffMs must be >= engineBackoffMs')
   }
   ctx.web.registerSearchProvider(new PublicSearchProvider({
     engines: createEngines(engines, userAgent),
@@ -155,5 +184,7 @@ export function apply(ctx: Context, config: Config): void {
     maxRetries,
     retryDelayMs,
     failureCooldownMs,
+    engineBackoffMs,
+    maxEngineBackoffMs,
   }))
 }

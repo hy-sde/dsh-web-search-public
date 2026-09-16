@@ -2,8 +2,10 @@
  * Provider-level tests: fan-out semantics (all engines queried concurrently,
  * consensus merge with engine-order tiebreak), deadline behavior (return at
  * soft deadline with success, wait past soft for the first success, hard cap
- * with zero successes), straggler abort, aggregate failure, abort handling,
- * availability, and a full plugin boot against a stubbed fetch.
+ * with zero successes), straggler abort, aggregate failure, per-engine circuit
+ * breaker (hard 4xx trips, empty-streak trips, backoff doubling and recovery),
+ * retry/cooldown policy, abort handling, availability, and a full plugin boot
+ * against a stubbed fetch.
  * @module @hy-sde-org/dsh-web-search-public/tests/public
  */
 
@@ -71,6 +73,8 @@ type ProviderOverrides = Partial<{
   maxRetries: number
   retryDelayMs: number
   failureCooldownMs: number
+  engineBackoffMs: number
+  maxEngineBackoffMs: number
 }>
 
 function provider(engines: PublicEngine[], overrides: ProviderOverrides = {}): PublicSearchProvider {
@@ -80,10 +84,13 @@ function provider(engines: PublicEngine[], overrides: ProviderOverrides = {}): P
     softDeadlineMs: 5_000,
     hardDeadlineMs: 30_000,
     // Retries/cooldown are opt-in per test so the pre-existing aggregate-failure
-    // expectations keep their single-attempt timing.
+    // expectations keep their single-attempt timing. The per-engine breaker is
+    // on with a short base window so breaker tests stay fast.
     maxRetries: 0,
     retryDelayMs: 2_000,
     failureCooldownMs: 30_000,
+    engineBackoffMs: 5_000,
+    maxEngineBackoffMs: 20_000,
     ...overrides,
   })
 }
@@ -225,13 +232,13 @@ describe('PublicSearchProvider', () => {
     await vi.waitFor(() => { expect(slow.calls.length).toBe(1) })
   })
 
-  it('retries the fan-out after an all-failed transport burst and recovers', async () => {
+  it('retries the fan-out after an all-failed HTTP 5xx burst and recovers', async () => {
     let calls = 0
     const flaky: PublicEngine = {
       id: 'mojeek',
       async search(): Promise<WebSearchSource[]> {
         calls += 1
-        if (calls === 1) throw new Error('HTTP 403')
+        if (calls === 1) throw new Error('HTTP 502')
         return [{ url: 'https://m.test/7', title: 'Recovered' }]
       },
     }
@@ -255,22 +262,31 @@ describe('PublicSearchProvider', () => {
     expect(result.sources).toEqual([{ url: 'https://d.test/8', title: 'Back online' }])
   })
 
-  it('exhausts retries on a transport failure and fast-fails inside the cooldown window', async () => {
+  it('does not retry an HTTP 4xx hard block and fast-fails inside the cooldown window', async () => {
     const blocked = stubEngine('mojeek', { error: new Error('HTTP 403') })
-    const subject = provider([blocked.engine], { maxRetries: 1, retryDelayMs: 2, failureCooldownMs: 100 })
-    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
-    expect(blocked.calls).toHaveLength(2)
-    // The second call sits inside the cooldown: it fails fast with a clear
-    // rate-limit message and does not touch the engines again.
+    const subject = provider([blocked.engine], {
+      maxRetries: 3,
+      retryDelayMs: 2,
+      failureCooldownMs: 100,
+      engineBackoffMs: 50,
+    })
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_ERROR',
+      message: 'all public search engines failed: mojeek: HTTP 403',
+    })
+    expect(blocked.calls).toHaveLength(1) // 4xx is never retried
+    // The second call sits inside the aggregate cooldown: it fails fast with a
+    // clear rate-limit message and does not touch the engines again.
     await expect(subject.search({ query: 'q' })).rejects.toMatchObject({
       code: 'WEB_PROVIDER_ERROR',
       message: /rate limited/,
     })
-    expect(blocked.calls).toHaveLength(2)
-    // Past the cooldown window a normal search resumes (and fails again here).
+    expect(blocked.calls).toHaveLength(1)
+    // Past the cooldown and the breaker window a normal search resumes (and
+    // hard-blocks again).
     await new Promise(resolve => setTimeout(resolve, 150))
     await expect(subject.search({ query: 'q' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
-    expect(blocked.calls).toHaveLength(4)
+    expect(blocked.calls).toHaveLength(2)
   })
 
   it('does not retry or arm the cooldown when every engine returns no results', async () => {
@@ -281,19 +297,101 @@ describe('PublicSearchProvider', () => {
       message: 'all public search engines failed: mojeek: no results',
     })
     expect(empty.calls).toHaveLength(1)
-    // No cooldown was armed, so the next search runs immediately.
+    // First no-results search arms nothing (query-level), so the next search
+    // runs immediately.
     await expect(subject.search({ query: 'other' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
     expect(empty.calls).toHaveLength(2)
   })
 
   it('aborts promptly while sleeping through the retry backoff', async () => {
-    const blocked = stubEngine('mojeek', { error: new Error('HTTP 403') })
+    const flaky = stubEngine('mojeek', { error: new Error('fetch failed') })
     const controller = new AbortController()
-    const pending = provider([blocked.engine], { maxRetries: 1, retryDelayMs: 10_000 })
+    const pending = provider([flaky.engine], { maxRetries: 1, retryDelayMs: 10_000 })
       .search({ query: 'q' }, controller.signal)
     setTimeout(() => { controller.abort() }, 5)
     await expect(pending).rejects.toMatchObject({ code: 'WEB_ABORTED' })
+    expect(flaky.calls).toHaveLength(1)
+  })
+
+  it('skips a hard-blocked engine on later searches instead of re-blasting it', async () => {
+    const blocked = stubEngine('ecosia', { error: new Error('HTTP 403') })
+    const healthy = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/9', title: 'Healthy' }] })
+    const subject = provider([blocked.engine, healthy.engine], { engineBackoffMs: 5_000 })
+    const first = await subject.search({ query: 'q' })
+    expect(first.sources).toEqual([{ url: 'https://d.test/9', title: 'Healthy' }])
     expect(blocked.calls).toHaveLength(1)
+    const second = await subject.search({ query: 'q' })
+    expect(second.sources).toEqual([{ url: 'https://d.test/9', title: 'Healthy' }])
+    // The breaker is open: the engine was skipped without a network request.
+    expect(blocked.calls).toHaveLength(1)
+    expect(healthy.calls).toHaveLength(2)
+  })
+
+  it('trips an engine after consecutive empty responses and stops querying it', async () => {
+    const empty = stubEngine('duckduckgo', { sources: [] })
+    const healthy = stubEngine('startpage', { sources: [{ url: 'https://s.test/10', title: 'Alive' }] })
+    const subject = provider([empty.engine, healthy.engine], { engineBackoffMs: 5_000 })
+    await subject.search({ query: 'q' })
+    await subject.search({ query: 'q' })
+    expect(empty.calls).toHaveLength(2)
+    const third = await subject.search({ query: 'q' })
+    expect(third.sources).toEqual([{ url: 'https://s.test/10', title: 'Alive' }])
+    // The second empty opened the streak breaker: the third search skipped it.
+    expect(empty.calls).toHaveLength(2)
+  })
+
+  it('probes a tripped engine after the backoff and resets the window on success', async () => {
+    let calls = 0
+    const flaky: PublicEngine = {
+      id: 'mojeek',
+      async search(): Promise<WebSearchSource[]> {
+        calls += 1
+        if (calls === 1 || calls === 3) throw new Error('HTTP 403')
+        return [{ url: 'https://m.test/11', title: 'Recovered' }]
+      },
+    }
+    const subject = provider([flaky], { failureCooldownMs: 0, engineBackoffMs: 50, maxEngineBackoffMs: 200 })
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+    expect(calls).toBe(1)
+    await new Promise(resolve => setTimeout(resolve, 60)) // past the 50ms breaker
+    const result = await subject.search({ query: 'q' }) // probe succeeds
+    expect(calls).toBe(2)
+    expect(result.sources).toEqual([{ url: 'https://m.test/11', title: 'Recovered' }])
+    // A later failure after recovery starts at the BASE window again (50ms,
+    // not the doubled 100ms), so this probe is not skipped.
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+    expect(calls).toBe(3)
+    await new Promise(resolve => setTimeout(resolve, 60))
+    const again = await subject.search({ query: 'q' })
+    expect(again.sources).toEqual([{ url: 'https://m.test/11', title: 'Recovered' }])
+    expect(calls).toBe(4)
+  })
+
+  it('doubles the per-engine backoff on consecutive trips', async () => {
+    const blocked = stubEngine('mojeek', { error: new Error('HTTP 403') })
+    const subject = provider([blocked.engine], { failureCooldownMs: 0, engineBackoffMs: 50, maxEngineBackoffMs: 200 })
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+    expect(blocked.calls).toHaveLength(1) // trip 1: open 50ms
+    await new Promise(resolve => setTimeout(resolve, 80))
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+    expect(blocked.calls).toHaveLength(2) // probed, re-tripped: now open for 100ms
+    await new Promise(resolve => setTimeout(resolve, 80))
+    // Still inside the doubled 100ms window: skipped, no request goes out.
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_ERROR',
+      message: /skipped \(recent failures: HTTP 403\)/,
+    })
+    expect(blocked.calls).toHaveLength(2)
+  })
+
+  it('engineBackoffMs: 0 disables the per-engine breaker', async () => {
+    const blocked = stubEngine('ecosia', { error: new Error('HTTP 403') })
+    const healthy = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/12', title: 'OK' }] })
+    const subject = provider([blocked.engine, healthy.engine], { engineBackoffMs: 0 })
+    await subject.search({ query: 'q' })
+    await subject.search({ query: 'q' })
+    // Breaker disabled: the 403 engine is still queried on every search.
+    expect(blocked.calls).toHaveLength(2)
   })
 })
 

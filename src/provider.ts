@@ -20,14 +20,14 @@ import type {
   WebSearchSource,
 } from '@deepseek-ai/dsh-web'
 import { Cause, Data, Effect, Scheduler } from 'effect'
-import type { PublicEngine } from './types.ts'
+import type { PublicEngine, PublicEngineId } from './types.ts'
 
 /**
  * Error channel for one engine's failed search. Tagged so the effect error
  * stays typed; it is recovered into the `failed` attempt kind immediately
  * inside the attempt effect and never escapes.
  */
-class EngineSearchError extends Data.TaggedError('EngineSearchError')<{ readonly cause: unknown }> {}
+class EngineSearchError extends Data.TaggedError('EngineSearchError')<{ readonly cause: unknown }> { }
 
 /**
  * Effect's default scheduler dispatches on `setImmediate`; the sync scheduler
@@ -57,10 +57,11 @@ export const HARD_DEADLINE_MS = 30_000
 
 /**
  * Retries for the all-engines-failed aggregate when at least one engine died
- * from a transport failure (HTTP 4xx/5xx or a timeout) — the anti-bot
- * rate-limit signature. A retry re-runs the whole fan-out after a backoff, so
- * a short engine throttle that strips the first attempt still yields results.
- * 0 disables retrying.
+ * from a *retryable* transport failure (HTTP 5xx, a timeout, or a network-level
+ * fetch failure). A retry re-runs the whole fan-out after a backoff, so a short
+ * engine throttle that strips the first attempt still yields results. Hard
+ * blocks (HTTP 4xx — the anti-bot rate-limit signature) are never retried:
+ * they open that engine's circuit breaker instead. 0 disables retrying.
  */
 export const DEFAULT_MAX_RETRIES = 1
 
@@ -68,12 +69,32 @@ export const DEFAULT_MAX_RETRIES = 1
 export const DEFAULT_RETRY_DELAY_MS = 2_000
 
 /**
- * Fast-fail window (ms) after a retry-exhausted rate-limit failure: searches in
- * this window return a clear "retry in about Ns" error instead of re-blasting
- * engines that just throttled us, which would deepen the block. 0 disables the
- * window.
+ * Fast-fail window (ms) after an all-engines-down failure (retry exhausted, or
+ * every engine hard-blocked/tripped): searches in this window return a clear
+ * "retry in about Ns" error instead of re-blasting engines that just throttled
+ * us, which would deepen the block. 0 disables the window. Default: 5 minutes.
  */
-export const DEFAULT_FAILURE_COOLDOWN_MS = 30_000
+export const DEFAULT_FAILURE_COOLDOWN_MS = 300_000
+
+/**
+ * Base per-engine circuit-breaker window (ms): an engine that hard-blocks
+ * (HTTP 4xx) or trips the empty-result streak is skipped for this long instead
+ * of being re-blasted on every search. The window doubles per consecutive trip
+ * up to {@link DEFAULT_MAX_ENGINE_BACKOFF_MS} and resets after a successful
+ * probe. 0 disables the per-engine breaker. Default: 5 minutes.
+ */
+export const DEFAULT_ENGINE_BACKOFF_MS = 300_000
+
+/** Cap for the doubled per-engine circuit-breaker window. Default: 1 hour. */
+export const DEFAULT_MAX_ENGINE_BACKOFF_MS = 3_600_000
+
+/**
+ * Consecutive zero-result responses that open an engine's soft circuit
+ * breaker. A single obscure query must not disable an engine; a block page
+ * that parses to zero results repeats for *every* query, so two in a row is
+ * the block signal.
+ */
+const EMPTY_STREAK_TO_TRIP = 2
 
 /** Resolved provider options (the plugin's `apply` supplies config defaults). */
 export interface PublicSearchProviderOptions {
@@ -89,23 +110,79 @@ export interface PublicSearchProviderOptions {
   /** Hard aggregate deadline (ms). Default: {@link HARD_DEADLINE_MS}. */
   readonly hardDeadlineMs?: number
   /**
-   * Retries for the all-failed aggregate on the rate-limit signature.
+   * Retries for the all-failed aggregate on the retryable transport signature.
    * Default: {@link DEFAULT_MAX_RETRIES}. 0 disables.
    */
   readonly maxRetries?: number
   /** Base retry delay (ms), doubled per attempt. Default: {@link DEFAULT_RETRY_DELAY_MS}. */
   readonly retryDelayMs?: number
   /**
-   * Fast-fail window (ms) after a retry-exhausted rate-limit failure.
+   * Fast-fail window (ms) after an all-engines-down failure.
    * Default: {@link DEFAULT_FAILURE_COOLDOWN_MS}. 0 disables.
    */
   readonly failureCooldownMs?: number
+  /**
+   * Base per-engine circuit-breaker window (ms); doubles per consecutive trip
+   * up to `maxEngineBackoffMs`. Default: {@link DEFAULT_ENGINE_BACKOFF_MS}.
+   * 0 disables the per-engine breaker.
+   */
+  readonly engineBackoffMs?: number
+  /**
+   * Cap for the doubled per-engine circuit-breaker window.
+   * Default: {@link DEFAULT_MAX_ENGINE_BACKOFF_MS}.
+   */
+  readonly maxEngineBackoffMs?: number
 }
 
 type EngineAttempt =
   | { readonly kind: 'ok'; readonly sources: WebSearchSource[] }
   | { readonly kind: 'timedOut' }
   | { readonly kind: 'failed'; readonly message: string }
+
+/** Per-engine circuit-breaker state. */
+interface EngineHealth {
+  /** Epoch ms until which the engine is skipped; 0 = healthy. */
+  brokenUntil: number
+  /** Current backoff window (doubles per consecutive trip, resets on recovery). */
+  backoffMs: number
+  /** Consecutive zero-result searches (soft trip signal). */
+  emptyStreak: number
+  /** Why the breaker opened last, surfaced in the aggregate error. */
+  reason: string
+}
+
+/**
+ * Internal aggregate-failure signal. Carries the per-engine detail the
+ * provider needs to decide retry vs. trip vs. cooldown; converted to a
+ * `WEB_PROVIDER_ERROR` {@link WebError} only at the `search` boundary.
+ */
+class AllFailedError extends Error {
+  readonly failures: readonly string[]
+  readonly skipped: readonly string[]
+  readonly hardFailed: readonly PublicEngineId[]
+  readonly softFailed: readonly PublicEngineId[]
+  /** Number of per-engine breaker trips recorded during this fan-out. */
+  readonly trips: number
+
+  constructor(
+    failures: readonly string[],
+    skipped: readonly string[],
+    hardFailed: readonly PublicEngineId[],
+    softFailed: readonly PublicEngineId[],
+    trips: number,
+  ) {
+    const detail = failures.length > 0
+      ? `all public search engines failed: ${[...failures, ...skipped].join('; ')}`
+      : `all public search engines unavailable: ${skipped.join('; ')}`
+    super(detail)
+    this.name = 'AllFailedError'
+    this.failures = failures
+    this.skipped = skipped
+    this.hardFailed = hardFailed
+    this.softFailed = softFailed
+    this.trips = trips
+  }
+}
 
 /** Accumulator for one deduplicated URL across engines. */
 export interface MergedSource {
@@ -174,6 +251,29 @@ function toResult(merged: Map<string, MergedSource>, maxResults: number | undefi
   }
 }
 
+/**
+ * Hard block signature: HTTP 4xx (403, 429, …) — the anti-bot rate-limit
+ * answer. Never retried; opens the engine's circuit breaker immediately.
+ */
+const HARD_BLOCK_RE = /HTTP 4\d\d/
+
+/**
+ * Retryable transport signature: HTTP 5xx, a timeout, or a network-level fetch
+ * failure. Retried once per budget; if it persists past the retry budget the
+ * engine's circuit breaker opens.
+ */
+const SOFT_TRANSPORT_RE = /HTTP 5\d\d|timed out|fetch failed/i
+
+/** Whether one engine died on a hard anti-bot block. */
+function isHardBlock(message: string): boolean {
+  return HARD_BLOCK_RE.test(message)
+}
+
+/** Whether one engine died on a retryable transport problem. */
+function isSoftTransport(message: string): boolean {
+  return SOFT_TRANSPORT_RE.test(message)
+}
+
 /** The credential-free public web search provider. */
 export class PublicSearchProvider implements WebSearchProvider {
   readonly id = PUBLIC_PROVIDER_ID
@@ -184,15 +284,23 @@ export class PublicSearchProvider implements WebSearchProvider {
   private readonly retryDelayMs: number
   /** Resolved fast-fail window (see {@link PublicSearchProviderOptions.failureCooldownMs}). */
   private readonly failureCooldownMs: number
-  /** Epoch ms of the last retry-exhausted rate-limit failure; 0 = none yet. */
+  /** Resolved per-engine breaker base window (see {@link PublicSearchProviderOptions.engineBackoffMs}). */
+  private readonly engineBackoffMs: number
+  /** Resolved per-engine breaker cap (see {@link PublicSearchProviderOptions.maxEngineBackoffMs}). */
+  private readonly maxEngineBackoffMs: number
+  /** Epoch ms of the last all-engines-down failure; 0 = none yet. */
   private lastAllFailureAt = 0
-  /** Aggregate message of that last rate-limit failure, surfaced by fast-fails. */
+  /** Aggregate message of that last failure, surfaced by fast-fails. */
   private lastAllFailureMessage = ''
+  /** Per-engine circuit-breaker state, keyed by engine id. */
+  private readonly health = new Map<PublicEngineId, EngineHealth>()
 
   constructor(private readonly options: PublicSearchProviderOptions) {
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES
     this.retryDelayMs = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
     this.failureCooldownMs = options.failureCooldownMs ?? DEFAULT_FAILURE_COOLDOWN_MS
+    this.engineBackoffMs = options.engineBackoffMs ?? DEFAULT_ENGINE_BACKOFF_MS
+    this.maxEngineBackoffMs = options.maxEngineBackoffMs ?? DEFAULT_MAX_ENGINE_BACKOFF_MS
   }
 
   /** Credential-free: usable whenever at least one engine is configured. */
@@ -205,9 +313,9 @@ export class PublicSearchProvider implements WebSearchProvider {
     if (this.options.engines.length === 0) {
       throw new WebError('no public search engines configured', 'WEB_PROVIDER_UNAVAILABLE')
     }
-    // Fast-fail during the cooldown window after a retry-exhausted rate-limit
-    // failure: re-blasting engines that just throttled us deepens the block, so
-    // surface a clear "try again shortly" error instead of burning requests.
+    // Fast-fail during the cooldown window after an all-engines-down failure:
+    // re-blasting engines that just throttled us deepens the block, so surface
+    // a clear "try again shortly" error instead of burning requests.
     if (this.failureCooldownMs > 0 && this.lastAllFailureAt > 0) {
       const elapsed = Date.now() - this.lastAllFailureAt
       if (elapsed < this.failureCooldownMs) {
@@ -218,24 +326,28 @@ export class PublicSearchProvider implements WebSearchProvider {
         )
       }
     }
-    // Retry the whole fan-out when every engine failed with a transport-level
-    // signature (HTTP 4xx/5xx or timeout) — the anti-bot rate-limit pattern. A
-    // pure all-no-results aggregate is query-level and fails immediately.
+    // Retry the whole fan-out when every engine failed and at least one died on
+    // a retryable transport problem (HTTP 5xx / timeout / network failure).
+    // Hard blocks (HTTP 4xx) and pure all-no-results aggregates are
+    // query-level/hostile and fail immediately. Engines that open their
+    // circuit breaker mid-search are skipped by the retry pass.
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await this.fanOut(request, signal)
       } catch (error) {
-        if (
-          error instanceof WebError
-          && error.code === 'WEB_PROVIDER_ERROR'
-          && isTransportFailure(error.message)
-        ) {
-          if (attempt < this.maxRetries) {
+        if (error instanceof AllFailedError) {
+          if (error.softFailed.length > 0 && attempt < this.maxRetries) {
             await sleep(this.retryDelayMs * 2 ** attempt, signal)
             continue
           }
-          this.lastAllFailureAt = Date.now()
-          this.lastAllFailureMessage = error.message
+          // Retry budget exhausted (or no retryable cause): soft-failed engines
+          // open their breaker too, so the next search probes fewer engines.
+          for (const id of error.softFailed) this.trip(id, 'transport failure')
+          if (error.skipped.length > 0 || error.trips > 0 || error.softFailed.length > 0) {
+            this.lastAllFailureAt = Date.now()
+            this.lastAllFailureMessage = error.message
+          }
+          throw new WebError(error.message, 'WEB_PROVIDER_ERROR')
         }
         throw error
       }
@@ -245,7 +357,7 @@ export class PublicSearchProvider implements WebSearchProvider {
   /**
    * One fan-out pass over every engine (the pre-retry aggregate): races the
    * soft/hard deadlines, merges the consensus result, and throws
-   * `WEB_PROVIDER_ERROR` only when every engine failed.
+   * {@link AllFailedError} only when every engine failed or was skipped.
    */
   private async fanOut(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
     const engines = this.options.engines
@@ -256,26 +368,45 @@ export class PublicSearchProvider implements WebSearchProvider {
     // per-engine timeout on top of the shared race signal; the straggler
     // controller lets the aggregate cancel still-running engines once it
     // decides to return. Individual failures are tolerated — the call fails
-    // only when every engine fails.
+    // only when every engine fails. Engines whose circuit breaker is open are
+    // skipped without a network request.
     const straggler = new AbortController()
     const raceSignal = signal ? AbortSignal.any([signal, straggler.signal]) : straggler.signal
 
     const responses = new Array<readonly WebSearchSource[] | undefined>(engines.length)
     const failures: string[] = []
-    let resolveFirstSuccess: () => void = () => {}
+    const skipped: string[] = []
+    const hardFailed: PublicEngineId[] = []
+    const softFailed: PublicEngineId[] = []
+    const tripCounter = { count: 0 }
+    let resolveFirstSuccess: () => void = () => { }
     const firstSuccess = new Promise<void>((resolve) => { resolveFirstSuccess = resolve })
 
     const all = Promise.all(engines.map(async (engine, index) => {
+      const tripped = this.isTripped(engine.id)
+      if (tripped.tripped) {
+        skipped.push(`${engine.id}: skipped (recent failures: ${tripped.reason})`)
+        return
+      }
       const attempt = await this.attempt(engine, request, raceSignal)
       if (attempt.kind === 'ok' && attempt.sources.length > 0) {
         responses[index] = attempt.sources
+        this.recordSuccess(engine.id)
         resolveFirstSuccess()
       } else if (attempt.kind === 'ok') {
         failures.push(`${engine.id}: no results`)
+        this.recordEmpty(engine.id, tripCounter)
       } else if (attempt.kind === 'timedOut') {
         failures.push(`${engine.id}: timed out after ${this.options.timeoutMs}ms`)
+        softFailed.push(engine.id)
       } else if (attempt.message !== 'aborted by caller') {
         failures.push(`${engine.id}: ${attempt.message}`)
+        if (isHardBlock(attempt.message)) {
+          hardFailed.push(engine.id)
+          this.recordTrip(engine.id, attempt.message, tripCounter)
+        } else if (isSoftTransport(attempt.message)) {
+          softFailed.push(engine.id)
+        }
       }
     }))
 
@@ -284,7 +415,7 @@ export class PublicSearchProvider implements WebSearchProvider {
     // success, bounded by the hard deadline.
     await Promise.race([all, sleep(softMs)])
     const hasSuccess = responses.some(response => response !== undefined)
-    if (!hasSuccess && failures.length < engines.length) {
+    if (!hasSuccess && failures.length + skipped.length < engines.length) {
       await Promise.race([all, firstSuccess, sleep(Math.max(0, hardMs - softMs))])
     }
     straggler.abort()
@@ -294,10 +425,69 @@ export class PublicSearchProvider implements WebSearchProvider {
     for (const response of responses) {
       if (response !== undefined) mergeSources(merged, response)
     }
-    if (merged.size === 0 && failures.length === engines.length) {
-      throw new WebError(`all public search engines failed: ${failures.join('; ')}`, 'WEB_PROVIDER_ERROR')
+    if (merged.size === 0 && failures.length + skipped.length === engines.length) {
+      throw new AllFailedError(failures, skipped, hardFailed, softFailed, tripCounter.count)
     }
     return toResult(merged, request.maxResults)
+  }
+
+  /** Whether an engine's circuit breaker is open right now. */
+  private isTripped(id: PublicEngineId): { tripped: boolean; reason: string } {
+    if (this.engineBackoffMs <= 0) return { tripped: false, reason: '' }
+    const h = this.healthOf(id)
+    if (h.brokenUntil > Date.now()) return { tripped: true, reason: h.reason }
+    return { tripped: false, reason: '' }
+  }
+
+  /** Open an engine's breaker and count the trip for the aggregate classifier. */
+  private recordTrip(id: PublicEngineId, reason: string, counter: { count: number }): void {
+    if (this.trip(id, reason)) counter.count += 1
+  }
+
+  /** Open an engine's circuit breaker; returns whether the breaker is armed. */
+  private trip(id: PublicEngineId, reason: string): boolean {
+    if (this.engineBackoffMs <= 0) return false
+    const h = this.healthOf(id)
+    const window = h.backoffMs === 0
+      ? this.engineBackoffMs
+      : Math.min(h.backoffMs * 2, this.maxEngineBackoffMs)
+    h.backoffMs = window
+    h.brokenUntil = Date.now() + window
+    h.reason = reason
+    h.emptyStreak = 0
+    return true
+  }
+
+  /** Clear the empty streak; a successful probe also resets the backoff window. */
+  private recordSuccess(id: PublicEngineId): void {
+    const h = this.healthOf(id)
+    h.emptyStreak = 0
+    if (h.brokenUntil > 0) {
+      h.brokenUntil = 0
+      h.backoffMs = 0
+    }
+  }
+
+  /**
+   * Count a zero-result response. Repeated empties are the soft block signal
+   * (challenge pages parse to zero results for every query, while a genuinely
+   * obscure query answers empty once): the streak opens the breaker.
+   */
+  private recordEmpty(id: PublicEngineId, counter: { count: number }): void {
+    const h = this.healthOf(id)
+    h.emptyStreak += 1
+    if (h.emptyStreak >= EMPTY_STREAK_TO_TRIP) {
+      this.recordTrip(id, `no results on ${h.emptyStreak} consecutive searches`, counter)
+    }
+  }
+
+  private healthOf(id: PublicEngineId): EngineHealth {
+    let h = this.health.get(id)
+    if (h === undefined) {
+      h = { brokenUntil: 0, backoffMs: 0, emptyStreak: 0, reason: '' }
+      this.health.set(id, h)
+    }
+    return h
   }
 
   /**
@@ -320,7 +510,7 @@ export class PublicSearchProvider implements WebSearchProvider {
     signal: AbortSignal | undefined,
   ): Promise<EngineAttempt> {
     const timeoutMs = this.options.timeoutMs
-    const program = Effect.gen(function* () {
+    const program = Effect.gen(function*() {
       if (signal?.aborted) return { kind: 'failed' as const, message: 'aborted by caller' }
       const controller = new AbortController()
       // Scope-owned forwarder: its release finalizer detaches the listener and
@@ -384,17 +574,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
-}
-
-/**
- * Whether an aggregate failure message carries the rate-limit signature: at
- * least one engine died on a transport error (HTTP 4xx/5xx), a timeout, or a
- * network-level fetch failure. Returns false for query-level aggregates where
- * every engine answered "no results" — retrying those cannot help and they must
- * not arm the cooldown.
- */
-function isTransportFailure(message: string): boolean {
-  return /HTTP [45]\d\d|timed out|fetch failed/i.test(message)
 }
 
 function aborted(): WebError {
