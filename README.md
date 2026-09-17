@@ -151,6 +151,23 @@ fetch arbitrary URLs, which defers SSRF exposure entirely.
 The worst case for the default configuration is ≈ `hardDeadlineMs` (30 s), well under the
 60-second search budget `dsh-tool-web` books in the shipped harness bundle.
 
+### Browser escalation (bot walls)
+
+Google, Ecosia and Mojeek are **browser-backed** (an omp `browserFetch` port): each engine
+first tries a plain `fetch` carrying coherent Chrome navigation headers (client hints
+derived from its UA), and when that is answered with a bot wall — an enable-JS retry page,
+a Cloudflare managed challenge ("Ecosia Firewall"), Mojeek's ALTCHA proof-of-work wall, or
+Google's "unusual traffic" `/sorry` gate — it escalates to a real browser via
+`ctx.browser.fetchPageHtml` (`@hy-sde-org/dsh-browser` service, stealth `launch` or
+CloakBrowser `patch` backend): home-URL cookie seeding, best-effort ready-selector wait, and
+ALTCHA auto-solve (force-click of the shadow-DOM checkbox + PoW redirect wait, omp's
+`solveCaptcha`). The circuit breaker only opens when every transport — fetch *and* browser —
+is blocked.
+
+Escalation is optional: mount the `browser` service row **before** this provider and the
+browser-backed engines light up; without it they stay fetch-only (original behavior), and
+`timeoutMs` (default 30 s) is the per-engine budget that covers fetch → browser steps.
+
 ## Configuration
 
 All options are optional; constants fill the defaults. Configure via the plugin row’s
@@ -159,7 +176,7 @@ All options are optional; constants fill the defaults. Configure via the plugin 
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `engines` | `startpage, duckduckgo, ecosia, google, mojeek` | engine ids the fan-out races; this order is the tiebreak for consensus ties; unlisted engines stay disabled |
-| `timeoutMs` | `10000` | per-engine transport timeout; bounds one engine even if it ignores aggregate cancellation |
+| `timeoutMs` | `30000` | per-engine transport timeout (ms): bounds one engine even if it ignores aggregate cancellation; browser-backed engines may spend it on fetch → stealth-browser escalation, so the default is 30 s |
 | `softDeadlineMs` | `5000` | soft aggregate deadline — return as soon as all engines settled or this passes with ≥1 success |
 | `hardDeadlineMs` | `30000` | hard aggregate deadline — return whatever we have, even nothing; must be ≥ `softDeadlineMs` |
 | `maxRetries` | `1` | retries for the all-engines-failed aggregate when at least one engine died from a *retryable* transport failure (HTTP 5xx, a timeout, or a network fetch failure). Each retry re-runs the whole fan-out after a backoff, so a short engine throttle that strips the first attempt still yields results. `0` disables retrying. Hard blocks (HTTP 4xx) are never retried — they open that engine’s circuit breaker — and a pure all-`no results` aggregate is query-level and never retried. |
@@ -174,7 +191,7 @@ All options are optional; constants fill the defaults. Configure via the plugin 
   name: '@hy-sde-org/dsh-web-search-public'
   config:
     engines: [startpage, duckduckgo, google, mojeek]   # drop Ecosia, reorder
-    timeoutMs: 8000
+    timeoutMs: 30000
     softDeadlineMs: 4000
     hardDeadlineMs: 25000
     maxRetries: 1

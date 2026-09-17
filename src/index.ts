@@ -14,6 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { } from '@deepseek-ai/dsh-web'
 import { createEngines } from './engines/index.ts'
+import type { PageScraper } from './engines/browser-page.ts'
 import {
   DEFAULT_ENGINE_BACKOFF_MS,
   DEFAULT_FAILURE_COOLDOWN_MS,
@@ -128,6 +129,28 @@ function assertNonNegativeInteger(name: string, value: number): void {
   }
 }
 
+/**
+ * Browser escalation is optional: when the host `browser` service is mounted
+ * (a composition that also installs @hy-sde-org/dsh-browser), the
+ * browser-backed engines (google/ecosia/mojeek) can escalate challenged plain
+ * fetches to a real stealth browser via `fetchPageHtml`. Without it, they stay
+ * fetch-only. Resolved at `apply` time — mount the browser row before this
+ * provider.
+ */
+function resolveBrowserScraper(ctx: Context): PageScraper | undefined {
+  let browser: unknown
+  try {
+    browser = ctx.get('browser')
+  } catch {
+    return undefined
+  }
+  if (browser === null || browser === undefined) return undefined
+  const service = browser as { fetchPageHtml?: PageScraper }
+  if (typeof service.fetchPageHtml !== 'function') return undefined
+  const fetchPageHtml = service.fetchPageHtml
+  return (url, options) => fetchPageHtml(url, options)
+}
+
 /** Register the credential-free public search provider with `ctx.web`. */
 export function apply(ctx: Context, config: Config): void {
   // Schemastery fills an unconfigured `engines` array with `[]`, so guards
@@ -177,7 +200,7 @@ export function apply(ctx: Context, config: Config): void {
     throw new Error('web-search-public: maxEngineBackoffMs must be >= engineBackoffMs')
   }
   ctx.web.registerSearchProvider(new PublicSearchProvider({
-    engines: createEngines(engines, userAgent),
+    engines: createEngines(engines, userAgent, resolveBrowserScraper(ctx)),
     timeoutMs,
     softDeadlineMs,
     hardDeadlineMs,

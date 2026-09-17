@@ -5,9 +5,9 @@
 
 import { describe, expect, it } from 'vitest'
 import { parseDuckDuckGo, unwrapDdgHref } from '../src/engines/duckduckgo.ts'
-import { parseEcosia } from '../src/engines/ecosia.ts'
-import { parseGoogle, unwrapGoogleHref } from '../src/engines/google.ts'
-import { parseMojeek } from '../src/engines/mojeek.ts'
+import { parseEcosia, isBlockedPage } from '../src/engines/ecosia.ts'
+import { parseGoogle, unwrapGoogleHref, blockReason } from '../src/engines/google.ts'
+import { parseMojeek, isRobotPage } from '../src/engines/mojeek.ts'
 import { collectHiddenInputs, parseStartpage } from '../src/engines/startpage.ts'
 
 describe('unwrapDdgHref', () => {
@@ -219,5 +219,28 @@ describe('parseMojeek', () => {
 
   it('returns an empty list when no results-standard list exists', () => {
     expect(parseMojeek('<ul class="results-other"></ul>', 10)).toEqual([])
+  })
+})
+
+describe('bot-wall predicates', () => {
+  it('classifies Google enable-JS and traffic walls', () => {
+    expect(blockReason({ html: '<script src="/httpservice/retry/enablejs"></script>', status: 200, url: 'https://www.google.com/search' }))
+      .toBe('javascript')
+    expect(blockReason({ html: '<html></html>', status: 403, url: 'https://www.google.com/search' })).toBe('traffic')
+    expect(blockReason({ html: 'Unusual traffic', status: 200, url: 'https://www.google.com/search' })).toBe('traffic')
+    expect(blockReason({ html: '<div id="search"><a href="/url?q=x"><h3>ok</h3></a></div>', status: 200, url: 'u' }))
+      .toBeUndefined()
+  })
+
+  it('classifies Ecosia Cloudflare firewall pages', () => {
+    expect(isBlockedPage({ html: '<title>Ecosia Firewall</title>', status: 200, url: 'u' })).toBe(true)
+    expect(isBlockedPage({ html: '<html>_cf_chl_opt</html>', status: 403, url: 'u' })).toBe(true)
+    expect(isBlockedPage({ html: '<article class="result__a"></article>', status: 200, url: 'u' })).toBe(false)
+  })
+
+  it('classifies Mojeek ALTCHA walls only when results are absent', () => {
+    expect(isRobotPage({ html: '<div id="altcha-widget"></div>', status: 200, url: 'u' })).toBe(true)
+    expect(isRobotPage({ html: 'Sending automated queries', status: 403, url: 'u' })).toBe(true)
+    expect(isRobotPage({ html: '<ul class="results-standard"><li>x</li></ul>', status: 200, url: 'u' })).toBe(false)
   })
 })

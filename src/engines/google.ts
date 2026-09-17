@@ -1,35 +1,64 @@
 /**
  * Google engine: credential-free scrape of the classic results page. Google is
  * the most bot-challenged engine in the chain, so this engine is expected to
- * frequently advance the chain rather than succeed.
+ * frequently advance the chain rather than succeed. Browser-backed (omp port):
+ * when the plain fetch is answered with an enable-JS/enable-JS retry page, a
+ * 403/429, or an "unusual traffic" block, it escalates to the host's stealth
+ * browser and parses the rendered SERP.
  * @module @hy-sde-org/dsh-web-search-public/engines/google
  */
 
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { PublicEngine, PublicEngineId } from '../types.ts'
+import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { cleanText, dedupeSources, elementText, elementsByClass, isUsableUrl, parseAttrs, stripNoise } from './html.ts'
-import { fetchHtml } from './http.ts'
 
 const SEARCH_URL = 'https://www.google.com/search'
+const GOOGLE_HOME_URL = 'https://www.google.com/'
+const RESULT_RENDER_TIMEOUT_MS = 10_000
 
 /** Consent cookie so the results page renders in a privacy-basic layout. */
 const CONSENT_COOKIE = 'CONSENT=YES+cb.20231217-14-p0.en+FX+116; SOCS=CAISHAgBEhJnd3NfMjAyNTAxMDgtMF9SQzIaAmVuIAEaBgiA_LipBg'
 
+/** Distinguish Google's bot walls from a real SERP. Exported for tests. */
+export function blockReason(page: LoadedHtmlPage): 'javascript' | 'traffic' | undefined {
+  if (page.html.includes('/httpservice/retry/enablejs') && !/<h3\b/i.test(page.html)) return 'javascript'
+  if (
+    page.status === 403 ||
+    page.status === 429 ||
+    page.url.includes('/sorry/') ||
+    /unusual traffic|detected unusual traffic|g-recaptcha/i.test(page.html)
+  ) {
+    return 'traffic'
+  }
+  return undefined
+}
+
 export class GoogleEngine implements PublicEngine {
   readonly id: PublicEngineId = 'google'
 
-  constructor(private readonly userAgent: string) {}
+  constructor(private readonly userAgent: string, private readonly scraper?: PageScraper) { }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
     const count = Math.min(Math.max(request.maxResults ?? 10, 1), 20)
     const params = new URLSearchParams({ q: request.query, hl: 'en', num: String(count) })
-    const html = await fetchHtml({
-      url: `${SEARCH_URL}?${params}`,
-      headers: { cookie: CONSENT_COOKIE },
+    const page = await browserFetch(`${SEARCH_URL}?${params}`, {
       userAgent: this.userAgent,
-      signal,
+      ...(signal !== undefined ? { signal } : {}),
+      referer: GOOGLE_HOME_URL,
+      headers: { cookie: CONSENT_COOKIE },
+      ...(this.scraper !== undefined
+        ? {
+          browser: {
+            scrape: this.scraper,
+            homeUrl: GOOGLE_HOME_URL,
+            ready: { selector: 'a h3', timeoutMs: RESULT_RENDER_TIMEOUT_MS },
+            shouldFallback: (candidate: LoadedHtmlPage) => blockReason(candidate) !== undefined,
+          },
+        }
+        : {}),
     })
-    return parseGoogle(html, request.maxResults ?? 10)
+    return parseGoogle(page.html, request.maxResults ?? 10)
   }
 }
 

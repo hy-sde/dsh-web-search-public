@@ -22,12 +22,13 @@ export const DEFAULT_ENGINE_ORDER: readonly PublicEngineId[] = PUBLIC_ENGINE_IDS
 
 /**
  * Default per-engine transport timeout (ms). The fan-out starts every engine
- * concurrently and bounds the whole call with soft/hard aggregate deadlines,
- * so this cap only limits one engine that ignores the aggregate's cancellation
- * — comfortably under the 60 s search-tool budget `dsh-tool-web` mounts in the
- * base bundle.
+ * concurrently and bounds the whole call with soft/hard aggregate deadlines
+ * (5 s / 30 s), so this cap only limits one engine that ignores the
+ * aggregate's cancellation. Browser-backed engines (google/ecosia/mojeek) may
+ * spend it on fetch → stealth-browser escalation, so the default is 30 s —
+ * comfortably under the 60 s search-tool budget mounted by the web seam.
  */
-export const DEFAULT_ENGINE_TIMEOUT_MS = 10_000
+export const DEFAULT_ENGINE_TIMEOUT_MS = 30_000
 
 /** One credential-free search backend the provider fans out to. */
 export interface PublicEngine {
