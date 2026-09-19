@@ -1,6 +1,6 @@
 {
   "name": "@hy-sde-org/dsh-web-search-public",
-  "version": "0.1.5-rc.1",
+  "version": "0.1.6-alpha.2",
   "description": "Credential-free concurrent web search fan-out for DeepSeek Harness (Startpage, DuckDuckGo, Ecosia, Google, Mojeek, consensus-merged, soft/hard deadlines)",
   "type": "module",
   "main": "./dist/index.js",
@@ -74,13 +74,13 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-invariants": "^0.1.5-rc.1",
-    "@deepseek-ai/dsh-web": "^0.1.5-rc.1"
+    "@deepseek-ai/dsh-invariants": "^0.1.6-alpha.2",
+    "@deepseek-ai/dsh-web": "^0.1.6-alpha.2"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-invariants": "^0.1.5-rc.1",
-    "@deepseek-ai/dsh-web": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.6-alpha.2",
+    "@deepseek-ai/dsh-web": "^0.1.6-alpha.2",
     "@types/node": "24.12.4",
     "publint": "0.3.21",
     "tsx": "4.22.1",
