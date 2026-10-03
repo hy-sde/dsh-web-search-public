@@ -1,3 +1,9 @@
+<!-- MIRROR-NOTE:START -->
+> [!NOTE]
+> 📦 This plugin lives in the [**dsh-plugins**](https://github.com/hy-sde/dsh-plugins) monorepo — file issues & pull requests there.
+> npm: [`@hy-sde-org/dsh-web-search-public`](https://www.npmjs.com/package/@hy-sde-org/dsh-web-search-public)
+<!-- MIRROR-NOTE:END -->
+
 # dsh-web-search-public — credential-free web search for DeepSeek Harness
 
 A zero-API-key web search provider for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
