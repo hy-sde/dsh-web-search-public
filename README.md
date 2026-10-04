@@ -66,7 +66,7 @@ dsh plugin --profile web add "$PWD/$PACKAGE_TARBALL"
 cd ../..
 ```
 
-`npm pack` runs the normal `prepack` build and produces a tarball containing `dist/`. A direct
+`pnpm pack` runs the normal `prepack` build and produces a tarball containing `dist/`. A direct
 `github:<this-repo>` dependency does not contain built output and is not a supported install
 path — always install the built tarball (or the published package).
 
