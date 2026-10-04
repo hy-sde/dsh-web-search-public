@@ -59,11 +59,11 @@ dsh plugin --profile web add @hy-sde-org/dsh-web-search-public
 
 ```bash
 git clone git@github.com:hy-sde/dsh-plugins.git
-cd dsh-plugins
+cd dsh-plugins/dsh-web-search-public
 pnpm install
 PACKAGE_TARBALL="$(pnpm pack | tail -n 1)"
 dsh plugin --profile web add "$PWD/$PACKAGE_TARBALL"
-cd ..
+cd ../..
 ```
 
 `npm pack` runs the normal `prepack` build and produces a tarball containing `dist/`. A direct
