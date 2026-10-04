@@ -37,13 +37,13 @@ never pin a search to the tool budget.
 ## Prerequisites
 
 - Node.js 22.19 or newer with npm and pnpm on `PATH`;
-- DeepSeek Harness `0.1.2-rc.1` including the standard `dsh` CLI;
+- DeepSeek Harness `0.2.0-rc.2` including the standard `dsh` CLI;
 - no API keys — nothing else.
 
 Install the Harness CLI and pnpm before continuing:
 
 ```bash
-npm install --global @deepseek-ai/dsh@0.1.2-rc.1 pnpm
+npm install --global @deepseek-ai/dsh@0.2.0-rc.2 pnpm
 dsh --version
 ```
 
@@ -61,7 +61,7 @@ dsh plugin --profile web add @hy-sde-org/dsh-web-search-public
 git clone git@github.com:hy-sde/dsh-plugins.git
 cd dsh-plugins
 pnpm install
-PACKAGE_TARBALL="$(pnpm pack --silent)"
+PACKAGE_TARBALL="$(pnpm pack | tail -n 1)"
 dsh plugin --profile web add "$PWD/$PACKAGE_TARBALL"
 cd ..
 ```
@@ -249,7 +249,7 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
 | Component | Supported contract |
 | --- | --- |
 | Node.js | 22.19 or newer |
-| DeepSeek Harness | `0.1.2-rc.1` (`@deepseek-ai/dsh-web`, `@deepseek-ai/cordis` peer range) |
+| DeepSeek Harness | `0.2.0-rc.2` (`@deepseek-ai/dsh-web`, `@deepseek-ai/cordis` peer range) |
 | Seam | `ctx.web` `WebSearchProvider` (no key, no fetch provider) |
 
 The provider implements only the `WebSearchProvider` seam contract; the model-facing tool is
