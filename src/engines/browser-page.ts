@@ -106,8 +106,23 @@ export interface BrowserFetchOptions {
 /** Default per-`goto` bound for the browser fallback (below the 60 s tool budget). */
 export const BROWSER_PAGE_TIMEOUT_MS = 30_000
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+/** Abort-aware delay: rejects as canceled when the signal fires mid-wait. */
+function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new EngineSearchFailure('canceled', 'aborted by caller'))
+      return
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      reject(new EngineSearchFailure('canceled', 'aborted by caller'))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 async function fetchHtmlPage(url: string, options: BrowserFetchOptions): Promise<LoadedHtmlPage> {
@@ -153,10 +168,12 @@ async function browseHtmlPage(
   const retryDelayMs = fallback.retryDelayMs ?? 0
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    // The retry wait is abort-aware: an abort during the delay rejects before
+    // another scrape can start.
+    if (attempt > 0 && retryDelayMs > 0) await delay(retryDelayMs, signal)
     // Caller cancellation is terminal: never start (or continue) a browser
     // navigation for an already-aborted search.
     if (signal?.aborted) throw new EngineSearchFailure('canceled', 'aborted by caller')
-    if (attempt > 0 && retryDelayMs > 0) await delay(retryDelayMs)
     let loaded: LoadedHtmlPage
     try {
       loaded = await fallback.scrape(url, {
@@ -170,6 +187,8 @@ async function browseHtmlPage(
       if (error instanceof BrowserUnavailableError) onUnavailable()
       throw error
     }
+    // A page that lands after the caller aborted is discarded, not parsed.
+    if (signal?.aborted) throw new EngineSearchFailure('canceled', 'aborted by caller')
     if (!fallback.shouldFallback(loaded)) {
       if (loaded.status >= 200 && loaded.status < 300) return loaded
       // A clean non-2xx page from the browser navigation: no point retrying.
@@ -207,7 +226,15 @@ export async function browserFetch(url: string, options: BrowserFetchOptions): P
 
   // A result that lands after the caller aborted is discarded, not parsed.
   if (options.signal?.aborted) throw new EngineSearchFailure('canceled', 'aborted by caller')
-  if (fallback === undefined || options.fetchImpl !== undefined) return page
+  if (fallback === undefined || options.fetchImpl !== undefined) {
+    // No escalation available: a clean non-2xx page is a structured http
+    // failure instead of a body the engines would parse (fetch-only engines
+    // must not scrape a 503 response into "sources").
+    if (!(page.status >= 200 && page.status < 300)) {
+      throw new EngineSearchFailure('http', `HTTP ${page.status}`, page.status)
+    }
+    return page
+  }
   const isSuccessful = page.status >= 200 && page.status < 300
   if (isSuccessful && !fallback.shouldFallback(page)) return page
   return browseHtmlPage(url, fallback, options.pageTimeoutMs ?? BROWSER_PAGE_TIMEOUT_MS, options.signal, (): never => {

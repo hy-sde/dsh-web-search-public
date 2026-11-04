@@ -221,12 +221,12 @@ describe('browserFetch', () => {
       .rejects.toMatchObject({ kind: 'transport' })
   })
 
-  it('returns a non-2xx page as-is when fetchImpl is injected (test seam)', async () => {
-    const page = await browserFetch('https://www.google.com/search?q=x', {
+  it('classifies a non-2xx page as an http failure when fetchImpl is injected (test seam)', async () => {
+    await expect(browserFetch('https://www.google.com/search?q=x', {
       userAgent: UA,
       fetchImpl: (async () => new Response('sorry', { status: 403 })) as typeof fetch,
       browser: { scrape: challengeScraper, shouldFallback: () => true },
     })
-    expect(page.status).toBe(403)
+    ).rejects.toMatchObject({ kind: 'http', status: 403 })
   })
 })
