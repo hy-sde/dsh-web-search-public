@@ -496,6 +496,34 @@ describe('PublicSearchProvider', () => {
     expect(blocked.calls).toHaveLength(1)
   })
 
+  it('preserves breaker state from the last substantive attempt when the retry sleeps into the deadline', async () => {
+    // Attempt 1 fails fast with a soft (retryable) 503; the retry backoff
+    // outlives the remaining deadline, so attempt 2 short-circuits. The
+    // final error must still carry attempt 1's evidence: the engine breaker
+    // opens and the cooldown arms instead of the next search re-blasting.
+    const failing = stubEngine('startpage', { error: new EngineSearchFailure('http', 'HTTP 503', 503) })
+    const subject = provider([failing.engine], {
+      softDeadlineMs: 10,
+      hardDeadlineMs: 40,
+      maxRetries: 3,
+      retryDelayMs: 50,
+      engineBackoffMs: 5_000,
+      failureCooldownMs: 0,
+    })
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_ERROR',
+      message: /all public search engines failed: startpage: HTTP 503/,
+    })
+    expect(failing.calls).toHaveLength(1)
+    // Next search: the breaker opened from the substantive attempt, so the
+    // engine is skipped instead of contacted again.
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_ERROR',
+      message: /skipped \(recent failures: transport failure\)/,
+    })
+    expect(failing.calls).toHaveLength(1)
+  })
+
   it('aborts in-flight searches, drains them, and refuses new work once disposed', async () => {
     let observedAbort = false
     let slowCalls = 0
@@ -524,6 +552,42 @@ describe('PublicSearchProvider', () => {
       code: 'WEB_PROVIDER_UNAVAILABLE',
       message: /disposed/,
     })
+  })
+
+  it('drains engine work orphaned by an early soft-deadline return when disposing', async () => {
+    let settledSlow = false
+    let releaseSlow: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { releaseSlow = resolve })
+    const slow: PublicEngine = {
+      id: 'startpage',
+      async search(_request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+        // Register before the gate: the search signal may already be aborted
+        // (disposed) by the time the gate releases, and an aborted signal
+        // never retroactively dispatches to later listeners.
+        signal?.addEventListener('abort', () => { settledSlow = true }, { once: true })
+        await gate
+        return []
+      },
+    }
+    const fast = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/18', title: 'Quick' }] })
+    const subject = provider([slow, fast.engine], { softDeadlineMs: 10, hardDeadlineMs: 5_000 })
+
+    // The fast engine wins the soft-deadline race; the slow engine's attempt
+    // stays pending inside the fan-out aggregate after search() has returned.
+    const result = await subject.search({ query: 'q' })
+    expect(result.sources).toHaveLength(1)
+
+    // dispose() must not resolve until the orphaned engine work settles.
+    let disposeResolved = false
+    const drained = subject.dispose().then(() => { disposeResolved = true })
+    // Even though dispose() aborted the lifetime signal, the gated engine has
+    // not settled — the drain must still be pending.
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(disposeResolved).toBe(false)
+    releaseSlow?.()
+    await vi.waitFor(() => { expect(disposeResolved).toBe(true) })
+    await drained
+    expect(settledSlow).toBe(true)
   })
 })
 

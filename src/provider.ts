@@ -327,6 +327,13 @@ export class PublicSearchProvider implements WebSearchProvider {
   private readonly lifetime = new AbortController()
   /** In-flight searches, tracked so {@link dispose} can drain them. */
   private readonly active = new Set<Promise<unknown>>()
+  /**
+   * Engine-level aggregate promises (one per fan-out pass). An early deadline
+   * return abandons the aggregate while engines are still settling — dispose
+   * must drain these too, or unload leaves engine work (browser navigations,
+   * transport timers) running.
+   */
+  private readonly inflight = new Set<Promise<unknown>>()
   private disposed = false
 
   constructor(private readonly options: PublicSearchProviderOptions) {
@@ -351,7 +358,7 @@ export class PublicSearchProvider implements WebSearchProvider {
   async dispose(): Promise<void> {
     this.disposed = true
     this.lifetime.abort()
-    const pending = [...this.active]
+    const pending = [...this.active, ...this.inflight]
     if (pending.length > 0) await Promise.allSettled(pending)
   }
 
@@ -398,25 +405,37 @@ export class PublicSearchProvider implements WebSearchProvider {
   private async searchAll(request: WebSearchRequest, signal: AbortSignal): Promise<WebSearchResult> {
     const hardMs = this.options.hardDeadlineMs ?? HARD_DEADLINE_MS
     const deadlineAt = Date.now() + hardMs
+    // Last substantive all-failed record (one with real engine evidence).
+    // A bare deadline-exhaustion record must not erase its breaker/cooldown
+    // state when the retry budget runs out.
+    let lastFailure: AllFailedError | undefined
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await this.fanOut(request, signal, deadlineAt)
       } catch (error) {
         if (error instanceof AllFailedError) {
+          const substantive = error.failures.length > 0 || error.skipped.length > 0
+            || error.hardFailed.length > 0 || error.softFailed.length > 0
+          if (substantive) lastFailure = error
           const budgetLeft = Date.now() < deadlineAt
           if (error.softFailed.length > 0 && attempt < this.maxRetries && budgetLeft) {
             const remaining = Math.max(0, deadlineAt - Date.now())
             await sleep(Math.min(this.retryDelayMs * 2 ** attempt, remaining), signal)
             continue
           }
-          // Retry budget exhausted (or no retryable cause): soft-failed engines
-          // open their breaker too, so the next search probes fewer engines.
-          for (const id of error.softFailed) this.trip(id, 'transport failure')
-          if (error.skipped.length > 0 || error.trips > 0 || error.softFailed.length > 0) {
+          // Retry budget exhausted (or no retryable cause): finalize the last
+          // attempt that carried real evidence, so soft-failed engines still
+          // open their breaker and the cooldown still arms.
+          const final = substantive ? error : (lastFailure ?? error)
+          const message = substantive || lastFailure === undefined
+            ? final.message
+            : `${final.message} (deadline exhausted before the retry could start)`
+          for (const id of final.softFailed) this.trip(id, 'transport failure')
+          if (final.skipped.length > 0 || final.trips > 0 || final.softFailed.length > 0) {
             this.lastAllFailureAt = Date.now()
-            this.lastAllFailureMessage = error.message
+            this.lastAllFailureMessage = message
           }
-          throw new WebError(error.message, 'WEB_PROVIDER_ERROR')
+          throw new WebError(message, 'WEB_PROVIDER_ERROR')
         }
         throw error
       }
@@ -517,12 +536,21 @@ export class PublicSearchProvider implements WebSearchProvider {
       }
     }))
 
+    // Track the aggregate itself: an early return (soft deadline with a
+    // success in hand) abandons engines that are still settling, and dispose()
+    // must drain that engine work rather than leave it running after unload.
+    const trackedAll = all.finally(() => {
+      this.inflight.delete(trackedAll)
+    })
+    this.inflight.add(trackedAll)
+    void trackedAll.catch(() => { })
+
     // Earliest exit wins: every engine settled, the soft deadline elapsed with
     // a success in hand, or (with no success yet and engines still in flight)
     // the first success, bounded by the hard deadline.
     const soft = cancellableSleep(softMs)
     try {
-      await Promise.race([all, soft.promise])
+      await Promise.race([trackedAll, soft.promise])
       const hasSuccess = responses.some(response => response !== undefined)
       const settledCount = settled.reduce((count, done) => count + (done ? 1 : 0), 0)
       // Keep waiting for a first success while engines are still in flight; an
@@ -532,7 +560,7 @@ export class PublicSearchProvider implements WebSearchProvider {
       if (!hasSuccess && settledCount < engines.length) {
         const hard = cancellableSleep(Math.max(0, hardMs - softMs))
         try {
-          await Promise.race([all, firstSuccess, hard.promise])
+          await Promise.race([trackedAll, firstSuccess, hard.promise])
         } finally {
           hard.cancel()
         }
