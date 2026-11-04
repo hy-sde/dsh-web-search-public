@@ -10,6 +10,8 @@
 
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { PublicEngine, PublicEngineId } from '../types.ts'
+import { EngineSearchFailure } from '../types.ts'
+import { looksLikeChallengePage } from './challenge.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { cleanText, dedupeSources, elementText, elementsByClass, isUsableUrl, parseAttrs, stripNoise } from './html.ts'
 
@@ -58,7 +60,11 @@ export class GoogleEngine implements PublicEngine {
         }
         : {}),
     })
-    return parseGoogle(page.html, request.maxResults ?? 10)
+    const sources = parseGoogle(page.html, request.maxResults ?? 10)
+    if (sources.length === 0 && looksLikeChallengePage(page.html)) {
+      throw new EngineSearchFailure('challenge', 'google answered with a bot challenge page')
+    }
+    return sources
   }
 }
 
@@ -83,35 +89,37 @@ export function parseGoogle(html: string, limit: number): WebSearchSource[] {
   const region = searchIndex >= 0 ? doc.slice(searchIndex) : doc
 
   // Organic results are anchors wrapping an `<h3>`; ad and navigation noise is
-  // filtered by requiring an `h3` child and a usable href.
-  // Each organic entry remembers its anchor's offset so snippets can be
-  // paired by POSITION IN THE PAGE, not by list index.
-  const organic: { href: string; title: string; index: number }[] = []
-  for (const match of region.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/g)) {
+  // filtered by requiring an `h3` child and a usable href. Every h3-anchored
+  // candidate is kept as a WINDOW BOUNDARY even when invalid, so a rejected
+  // card's snippet cannot bleed into the previous result's window. Each entry
+  // remembers its anchor's offset so snippets pair by POSITION IN THE PAGE.
+  const candidates: { href: string | undefined; title: string | undefined; index: number }[] = []
+  for (const match of region.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^>"])*)>([\s\S]*?)<\/a>/g)) {
     const inner = match[2] ?? ''
     if (!/<h3[\s>]/i.test(inner)) continue
     const attrs = parseAttrs(match[1] ?? '')
     const href = unwrapGoogleHref(attrs.href ?? '')
-    if (href === undefined) continue
     const title = cleanText(inner)
-    if (title.length === 0) continue
-    organic.push({ href, title, index: match.index })
+    // Push EVERY h3-anchored candidate — even one with an unusable href or
+    // empty title — so it still closes the previous result's snippet window.
+    const usable = href !== undefined && title.length > 0
+    candidates.push({ href: usable ? href : undefined, title: usable ? title : undefined, index: match.index })
   }
 
   const snippetTags = elementsByClass(region, 'VwiC3b', 'div')
   const sources: WebSearchSource[] = []
-  for (let i = 0; i < organic.length && sources.length < limit; i += 1) {
-    const result = organic[i]
-    if (result === undefined) continue
+  for (let i = 0; i < candidates.length && sources.length < limit; i += 1) {
+    const candidate = candidates[i]
+    if (candidate === undefined || candidate.href === undefined || candidate.title === undefined) continue
     // Pair each result with the snippet tag that follows its own anchor and
     // precedes the next organic anchor. Pairing the two lists by position
     // mis-attributes snippets whenever any result lacks one.
-    const windowEnd = organic[i + 1]?.index ?? region.length
-    const snippetTag = snippetTags.find(tag => tag.start >= result.index && tag.start < windowEnd)
+    const windowEnd = candidates[i + 1]?.index ?? region.length
+    const snippetTag = snippetTags.find(tag => tag.start >= candidate.index && tag.start < windowEnd)
     const snippet = snippetTag === undefined ? undefined : elementText(region, snippetTag)
     sources.push({
-      url: result.href,
-      title: result.title,
+      url: candidate.href,
+      title: candidate.title,
       ...(snippet !== undefined && snippet.length > 0 ? { snippet } : {}),
     })
   }

@@ -9,8 +9,9 @@
  */
 
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
-import type { PublicEngine, PublicEngineId } from '../types.ts'
+import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
+import { looksLikeChallengePage } from './challenge.ts'
 import { cleanText, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
 
 const SEARCH_URL = 'https://www.mojeek.com/search'
@@ -51,7 +52,11 @@ export class MojeekEngine implements PublicEngine {
         }
         : {}),
     })
-    return parseMojeek(page.html, request.maxResults ?? 10)
+    const sources = parseMojeek(page.html, request.maxResults ?? 10)
+    if (sources.length === 0 && looksLikeChallengePage(page.html)) {
+      throw new EngineSearchFailure('challenge', 'mojeek answered with a bot challenge page')
+    }
+    return sources
   }
 }
 

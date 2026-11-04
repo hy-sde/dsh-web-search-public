@@ -3,8 +3,9 @@
  * @module @hy-sde-org/dsh-web-search-public/tests/engines
  */
 
-import { describe, expect, it } from 'vitest'
-import { parseDuckDuckGo, unwrapDdgHref } from '../src/engines/duckduckgo.ts'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { looksLikeChallengePage } from '../src/engines/challenge.ts'
+import { DuckDuckGoEngine, parseDuckDuckGo, unwrapDdgHref } from '../src/engines/duckduckgo.ts'
 import { parseEcosia, isBlockedPage } from '../src/engines/ecosia.ts'
 import { parseGoogle, unwrapGoogleHref, blockReason } from '../src/engines/google.ts'
 import { parseMojeek, isRobotPage } from '../src/engines/mojeek.ts'
@@ -154,6 +155,30 @@ describe('parseEcosia', () => {
     expect(sources[0]).toEqual({ url: 'https://ecosia.test/first', title: 'Ecosia First' })
     expect(sources[1]).toEqual({ url: 'https://ecosia.test/second', title: 'Ecosia Second', snippet: 'Second snippet only.' })
   })
+
+  it("does not leak a filtered card's snippet into the previous result's window", () => {
+    // The middle card has an invalid href (filtered out) but its own snippet.
+    // Snippet windows must close at its anchor even though it emits no result.
+    const sparse = [
+      '<div id="results">',
+      '  <article class="result">',
+      '    <a class="result__a" href="https://ecosia.test/first">Ecosia First</a>',
+      '  </article>',
+      '  <article class="result">',
+      '    <a class="result__a" href="javascript:void(0)">Ecosia Card</a>',
+      '    <p class="result__quote">Card snippet.</p>',
+      '  </article>',
+      '  <article class="result">',
+      '    <a class="result__a" href="https://ecosia.test/third">Ecosia Third</a>',
+      '    <p class="result__quote">Third snippet.</p>',
+      '  </article>',
+      '</div>',
+    ].join('')
+    const sources = parseEcosia(sparse, 10)
+    expect(sources).toHaveLength(2)
+    expect(sources[0]).toEqual({ url: 'https://ecosia.test/first', title: 'Ecosia First' })
+    expect(sources[1]).toEqual({ url: 'https://ecosia.test/third', title: 'Ecosia Third', snippet: 'Third snippet.' })
+  })
 })
 
 describe('unwrapGoogleHref', () => {
@@ -227,6 +252,28 @@ describe('parseGoogle', () => {
     expect(sources[0]).toEqual({ url: 'https://g.test/first', title: 'First' })
     expect(sources[1]).toEqual({ url: 'https://g.test/second', title: 'Second', snippet: 'Second snippet only.' })
   })
+
+  it("does not leak a filtered card's snippet into the previous result's window", () => {
+    const sparse = [
+      '<div id="search">',
+      '  <div class="g">',
+      '    <a href="https://g.test/first"><h3>First</h3></a>',
+      '  </div>',
+      '  <div class="g">',
+      '    <a href="javascript:void(0)"><h3>Card</h3></a>',
+      '    <div class="VwiC3b">Card snippet.</div>',
+      '  </div>',
+      '  <div class="g">',
+      '    <a href="https://g.test/third"><h3>Third</h3></a>',
+      '    <div class="VwiC3b">Third snippet.</div>',
+      '  </div>',
+      '</div>',
+    ].join('')
+    const sources = parseGoogle(sparse, 10)
+    expect(sources).toHaveLength(2)
+    expect(sources[0]).toEqual({ url: 'https://g.test/first', title: 'First' })
+    expect(sources[1]).toEqual({ url: 'https://g.test/third', title: 'Third', snippet: 'Third snippet.' })
+  })
 })
 
 describe('parseMojeek', () => {
@@ -278,5 +325,34 @@ describe('bot-wall predicates', () => {
     expect(isRobotPage({ html: '<div id="altcha-widget"></div>', status: 200, url: 'u' })).toBe(true)
     expect(isRobotPage({ html: 'Sending automated queries', status: 403, url: 'u' })).toBe(true)
     expect(isRobotPage({ html: '<ul class="results-standard"><li>x</li></ul>', status: 200, url: 'u' })).toBe(false)
+  })
+})
+
+describe('looksLikeChallengePage', () => {
+  it('recognizes common bot-wall signatures', () => {
+    expect(looksLikeChallengePage('<div id="px-captcha"></div>')).toBe(true)
+    expect(looksLikeChallengePage('Press &amp; Hold to continue')).toBe(true)
+    expect(looksLikeChallengePage('Unfortunately, bots use DuckDuckGo too.')).toBe(true)
+    expect(looksLikeChallengePage('<script src="/cdn-cgi/challenge-platform/h/g/orchestrate"></script>')).toBe(true)
+    expect(looksLikeChallengePage('<div class="g-recaptcha"></div>')).toBe(true)
+    expect(looksLikeChallengePage('unusual traffic from your computer network')).toBe(true)
+  })
+
+  it('does not flag ordinary pages', () => {
+    expect(looksLikeChallengePage('<html><body>No results found</body></html>')).toBe(false)
+    expect(looksLikeChallengePage('')).toBe(false)
+  })
+})
+
+describe('DuckDuckGoEngine', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('rejects a 200 challenge form as a structured challenge instead of an accepted empty page', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('Unfortunately, bots use DuckDuckGo too.', { status: 200 })))
+    const engine = new DuckDuckGoEngine('test-agent')
+    await expect(engine.search({ query: 'anything' }, undefined))
+      .rejects.toMatchObject({ kind: 'challenge' })
   })
 })

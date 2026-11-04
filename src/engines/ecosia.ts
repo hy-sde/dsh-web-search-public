@@ -8,7 +8,9 @@
 
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { PublicEngine, PublicEngineId } from '../types.ts'
+import { EngineSearchFailure } from '../types.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
+import { looksLikeChallengePage } from './challenge.ts'
 import { anchors, dedupeSources, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
 
 const SEARCH_URL = 'https://www.ecosia.org/search'
@@ -53,24 +55,31 @@ export class EcosiaEngine implements PublicEngine {
         }
         : {}),
     })
-    return parseEcosia(page.html, request.maxResults ?? 10)
+    const sources = parseEcosia(page.html, request.maxResults ?? 10)
+    if (sources.length === 0 && looksLikeChallengePage(page.html)) {
+      throw new EngineSearchFailure('challenge', 'ecosia answered with a bot challenge page')
+    }
+    return sources
   }
 }
 
 /** Parse Ecosia's server-rendered result page. Exported for contract tests. */
 export function parseEcosia(html: string, limit: number): WebSearchSource[] {
   const doc = stripNoise(html)
-  const links = anchors(doc)
-    .filter(anchor => isUsableUrl(anchor.href) && /(?:^|\s)result__a(?:$|\s)/.test(anchor.attrs.class ?? ''))
+  // Every result__a anchor is a WINDOW BOUNDARY even when its href is
+  // unusable, so a rejected card's snippet cannot bleed into the previous
+  // result's window.
+  const candidates = anchors(doc)
+    .filter(anchor => /(?:^|\s)result__a(?:$|\s)/.test(anchor.attrs.class ?? ''))
   const snippetTags = elementsByClass(doc, 'result__quote')
   const sources: WebSearchSource[] = []
-  for (let i = 0; i < links.length && sources.length < limit; i += 1) {
-    const link = links[i]
-    if (link === undefined) continue
+  for (let i = 0; i < candidates.length && sources.length < limit; i += 1) {
+    const link = candidates[i]
+    if (link === undefined || !isUsableUrl(link.href)) continue
     // Pair each link with the snippet tag that follows it and precedes the
     // next result link — pairing the two lists by position mis-attributes
     // snippets whenever any result lacks one.
-    const windowEnd = links[i + 1]?.start ?? doc.length
+    const windowEnd = candidates[i + 1]?.start ?? doc.length
     const snippetTag = snippetTags.find(tag => tag.start >= link.start && tag.start < windowEnd)
     const snippet = snippetTag === undefined ? undefined : elementText(doc, snippetTag)
     sources.push({
