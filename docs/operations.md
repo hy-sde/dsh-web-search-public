@@ -43,8 +43,8 @@ change and record what you observed.
   accept-language header.
 - Redirects: the plain-fetch legs of every engine use `redirect: "error"` — a redirect is
   rejected before any `Location` target is contacted. When a challenge triggers browser
-  escalation, the real browser navigates like a browser and follows redirects (inside the
-  engine's own home/results hosts).
+  escalation, the real browser navigates like a browser and follows redirects (a normal
+  page load; this bundle adds no host restriction of its own).
 - Fan-out: **all configured engines are contacted per query** (up to 5 concurrent anonymous
   requests, plus Startpage’s two-request handshake). There is no shared session, cookie jar,
   or IP pooling beyond what the platform itself provides. Expect higher bot-challenge /

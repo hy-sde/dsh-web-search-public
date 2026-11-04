@@ -117,7 +117,8 @@ disabled — deployments that prefer it keep their explicit choice by setting
 `web.searchProvider: deepseek-official` and providing the `DEEPSEEK_API_KEY` credential.
 This bundle mounts no fetch provider of its own and changes no `tool-web` settings; whether
 the model can fetch arbitrary URLs is decided by the `tool-web` row of your composition (the
-shipped harness base keeps `fetch: false`).
+shipped harness base enables `tool-web` fetch). SSRF posture is governed by the fetch
+provider's own guards in that row, not by this bundle.
 
 ## How the fan-out works
 
@@ -259,13 +260,13 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
   it raises bot-challenge / rate-limit exposure compared with a single-engine chain — see
   [docs/operations.md](docs/operations.md).
 - **No fetch provider of our own.** This bundle mounts no fetch provider and changes no
-  `tool-web` settings; the shipped harness base keeps `tool-web` `fetch: false`, so the model
-  cannot be pointed at arbitrary URLs and SSRF surfaces stay closed.
+  `tool-web` settings; whether the model can fetch arbitrary URLs is decided by your
+  `tool-web` row (the shipped harness base enables fetch), not by this bundle.
 - **Redirect policy is per-transport.** The plain-fetch legs of every engine use
   `redirect: "error"` — a redirect is rejected before any `Location` target is contacted.
   When a challenge triggers escalation, the real browser then navigates like a browser and
-  follows redirects; the escalated navigation stays inside the engine's own home/results
-  hosts.
+  follows redirects (it is a normal page navigation — no additional host restriction is
+  imposed by this bundle).
 - **Challenges are expected.** Startpage, Ecosia, and Google frequently serve bot checks;
   challenge pages are classified as structured `challenge` failures (they trip that engine's
   breaker and are absorbed by the fan-out), never parsed as zero results. See
