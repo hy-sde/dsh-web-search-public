@@ -14,7 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { } from '@deepseek-ai/dsh-web'
 import { createEngines } from './engines/index.ts'
-import type { PageScraper } from './engines/browser-page.ts'
+import { BrowserUnavailableError, type PageScraper } from './engines/browser-page.ts'
 import {
   DEFAULT_ENGINE_BACKOFF_MS,
   DEFAULT_FAILURE_COOLDOWN_MS,
@@ -64,13 +64,16 @@ export interface Config {
   /** Per-engine transport timeout (ms). Default: 10000. Each engine also dies here even if it ignores aggregate cancellation. */
   timeoutMs?: number
   /** Engine ids the fan-out races in this order (the tiebreak for consensus ties);
-   * unlisted engines stay disabled. Default: startpage, duckduckgo, ecosia, google, mojeek. */
+   * unlisted engines stay disabled. Default: startpage, duckduckgo, ecosia, google, mojeek.
+   * An explicit empty array is rejected at activation — omit the key for the
+   * default set. */
   engines?: PublicEngineId[]
   /** User-Agent sent to the engines. Defaults to a browser-shaped constant. */
   userAgent?: string
   /** Soft aggregate deadline (ms): return as soon as all engines settled or this passes with ≥1 success. Default: 5000. */
   softDeadlineMs?: number
-  /** Hard aggregate deadline (ms): return whatever we have, even nothing. Default: 30000. */
+  /** Hard aggregate deadline (ms): the overall budget across retries and their
+   * backoff — past it the call returns whatever it has, even nothing. Default: 30000. */
   hardDeadlineMs?: number
   /**
    * Retries for the all-engines-failed aggregate when at least one engine died
@@ -92,8 +95,9 @@ export interface Config {
   failureCooldownMs?: number
   /**
    * Base per-engine circuit-breaker window (ms): an engine that hard-blocks
-   * (HTTP 4xx) or returns no results repeatedly is skipped for this long
-   * instead of being re-blasted on every search. Doubles per consecutive trip
+   * (HTTP 4xx), answers with a challenge wall, or hangs past the aggregate
+   * deadline is skipped for this long instead of being re-blasted on every
+   * search. Doubles per consecutive trip
    * up to maxEngineBackoffMs; resets after a successful probe. Default: 300000
    * (5 min). 0 disables the per-engine breaker.
    */
@@ -130,34 +134,40 @@ function assertNonNegativeInteger(name: string, value: number): void {
 }
 
 /**
- * Browser escalation is optional: when the host `browser` service is mounted
- * (a composition that also installs @hy-sde-org/dsh-browser), the
- * browser-backed engines (google/ecosia/mojeek) can escalate challenged plain
- * fetches to a real stealth browser via `fetchPageHtml`. Without it, they stay
- * fetch-only. Resolved at `apply` time — mount the browser row before this
- * provider.
+ * Browser escalation resolves the host `browser` service LAZILY — at the first
+ * challenged fetch, not at `apply` time — so mount order never matters and a
+ * browser row mounted later still works. When the service is missing at
+ * escalation time the scraper throws {@link BrowserUnavailableError}, which
+ * `browserFetch` translates into the structured failure the escalation trigger
+ * warrants (a challenge stays a challenge and trips the breaker honestly; a
+ * transport failure keeps its retryable classification) instead of silently
+ * staying fetch-only.
  */
-function resolveBrowserScraper(ctx: Context): PageScraper | undefined {
-  let browser: unknown
-  try {
-    browser = ctx.get('browser')
-  } catch {
-    return undefined
+function resolveBrowserScraper(ctx: Context): PageScraper {
+  return (url, options) => {
+    let browser: unknown
+    try {
+      browser = ctx.get('browser')
+    } catch {
+      throw new BrowserUnavailableError()
+    }
+    const service = browser as { fetchPageHtml?: PageScraper } | null | undefined
+    const fetchPageHtml = service?.fetchPageHtml
+    if (typeof fetchPageHtml !== 'function') throw new BrowserUnavailableError()
+    return fetchPageHtml(url, options)
   }
-  if (browser === null || browser === undefined) return undefined
-  const service = browser as { fetchPageHtml?: PageScraper }
-  if (typeof service.fetchPageHtml !== 'function') return undefined
-  const fetchPageHtml = service.fetchPageHtml
-  return (url, options) => fetchPageHtml(url, options)
 }
 
 /** Register the credential-free public search provider with `ctx.web`. */
 export function apply(ctx: Context, config: Config): void {
-  // Schemastery fills an unconfigured `engines` array with `[]`, so guards
-  // cover both undefined and empty rather than relying on `??` alone.
-  const engines = config.engines !== undefined && config.engines.length > 0
-    ? config.engines
-    : [...DEFAULT_ENGINE_ORDER]
+  // Schemastery fills an unconfigured `engines` key with the default order and
+  // preserves an explicit `[]`, so `??` distinguishes the two cleanly.
+  const engines = config.engines ?? [...DEFAULT_ENGINE_ORDER]
+  if (engines.length === 0) {
+    throw new Error(
+      'web-search-public: engines must include at least one engine id; omit engines for the default set',
+    )
+  }
   const userAgent = config.userAgent !== undefined && config.userAgent.length > 0
     ? config.userAgent
     : DEFAULT_USER_AGENT
@@ -199,7 +209,7 @@ export function apply(ctx: Context, config: Config): void {
   if (maxEngineBackoffMs < engineBackoffMs) {
     throw new Error('web-search-public: maxEngineBackoffMs must be >= engineBackoffMs')
   }
-  ctx.web.registerSearchProvider(new PublicSearchProvider({
+  const provider = new PublicSearchProvider({
     engines: createEngines(engines, userAgent, resolveBrowserScraper(ctx)),
     timeoutMs,
     softDeadlineMs,
@@ -209,5 +219,11 @@ export function apply(ctx: Context, config: Config): void {
     failureCooldownMs,
     engineBackoffMs,
     maxEngineBackoffMs,
-  }))
+  })
+  ctx.web.registerSearchProvider(provider)
+  // Unloading aborts in-flight searches and drains them (async disposers are
+  // awaited by the loader) instead of abandoning requests mid-flight.
+  ctx.effect(() => async () => {
+    await provider.dispose()
+  }, 'web-search-public: drain in-flight searches')
 }

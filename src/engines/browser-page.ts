@@ -9,11 +9,21 @@
  * are browser-backed escalate to a real (stealth-patched / CloakBrowser)
  * browser via the injected {@link PageScraper}. The scraper lives in the
  * browser host service (`BrowserService.fetchPageHtml`) — never the tool —
- * and is optional: without one the engine simply stays fetch-only (the
- * previous behavior), so this package keeps zero hard dependency on it.
+ * and is optional: without one the engine simply stays fetch-only, so this
+ * package keeps zero hard dependency on it.
+ *
+ * Redirect policy is per-transport and honest about it: the plain-fetch leg
+ * uses `redirect: 'error'`, so a redirect is rejected before any `Location`
+ * target is contacted (it escalates to the browser where one is mounted — the
+ * browser then navigates like a real browser and follows redirects). A caller
+ * abort is terminal: an aborted fetch never escalates, and an abort observed
+ * at any step surfaces as a canceled {@link EngineSearchFailure}. Every
+ * terminal outcome is structured — challenge walls and clean non-2xx pages
+ * throw instead of returning a page the caller would parse as "no results".
  * @module @hy-sde-org/dsh-web-search-public/engines/browser-page
  */
 
+import { EngineSearchFailure } from '../types.ts'
 import { buildBrowserNavigationHeaders } from './browser-headers.ts'
 
 /** HTML plus the response status and final URL after redirects or browser navigation. */
@@ -41,6 +51,21 @@ export type PageScraper = (
     altcha?: { resultsSelector: string; waitMs: number }
   },
 ) => Promise<LoadedHtmlPage>
+
+/**
+ * Thrown by a lazy {@link PageScraper} when the host browser service is not
+ * mounted at call time. {@link browserFetch} translates it into the failure
+ * the escalation trigger warrants: a challenge/status trigger becomes a
+ * `challenge`/`http` {@link EngineSearchFailure}; a network-failure trigger
+ * re-surfaces the original error so a transient transport problem is not
+ * misclassified as a challenge.
+ */
+export class BrowserUnavailableError extends Error {
+  constructor(message = 'browser escalation unavailable: the browser service is not mounted') {
+    super(message)
+    this.name = 'BrowserUnavailableError'
+  }
+}
 
 /** Browser escalation configuration for one engine. */
 export interface BrowserFallbackOptions {
@@ -93,34 +118,74 @@ async function fetchHtmlPage(url: string, options: BrowserFetchOptions): Promise
       : {}),
     ...options.headers,
   }
-  const response = await (options.fetchImpl ?? fetch)(url, {
-    headers,
-    ...(options.signal !== undefined ? { signal: options.signal } : {}),
-  })
+  let response: Response
+  try {
+    response = await (options.fetchImpl ?? fetch)(url, {
+      headers,
+      redirect: 'error',
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    })
+  } catch (error) {
+    // `redirect: 'error'` rejects a redirect response as TypeError before any
+    // Location target is contacted, and undici reports network-level failures
+    // as TypeError too — both are retryable transport problems.
+    if (error instanceof TypeError) {
+      throw new EngineSearchFailure('transport', `redirect rejected or network failure: ${error.message}`)
+    }
+    throw error
+  }
   return { html: await response.text(), status: response.status, url: response.url || url }
 }
 
+/**
+ * Run the browser escalation attempts. `onUnavailable` converts a
+ * {@link BrowserUnavailableError} from the scraper into the failure the
+ * original escalation trigger warrants (never returns).
+ */
 async function browseHtmlPage(
   url: string,
   fallback: BrowserFallbackOptions,
   pageTimeoutMs: number,
   signal: AbortSignal | undefined,
+  onUnavailable: () => never,
 ): Promise<LoadedHtmlPage> {
   const attempts = Math.max(1, fallback.attempts ?? 1)
   const retryDelayMs = fallback.retryDelayMs ?? 0
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    // Caller cancellation is terminal: never start (or continue) a browser
+    // navigation for an already-aborted search.
+    if (signal?.aborted) throw new EngineSearchFailure('canceled', 'aborted by caller')
     if (attempt > 0 && retryDelayMs > 0) await delay(retryDelayMs)
-    const loaded = await fallback.scrape(url, {
-      ...(fallback.homeUrl !== undefined ? { homeUrl: fallback.homeUrl } : {}),
-      ...(fallback.ready !== undefined ? { ready: fallback.ready } : {}),
-      ...(fallback.altcha !== undefined ? { altcha: fallback.altcha } : {}),
-      timeoutMs: pageTimeoutMs,
-      ...(signal !== undefined ? { signal } : {}),
-    })
-    if (!fallback.shouldFallback(loaded) || attempt === attempts - 1) return loaded
+    let loaded: LoadedHtmlPage
+    try {
+      loaded = await fallback.scrape(url, {
+        ...(fallback.homeUrl !== undefined ? { homeUrl: fallback.homeUrl } : {}),
+        ...(fallback.ready !== undefined ? { ready: fallback.ready } : {}),
+        ...(fallback.altcha !== undefined ? { altcha: fallback.altcha } : {}),
+        timeoutMs: pageTimeoutMs,
+        ...(signal !== undefined ? { signal } : {}),
+      })
+    } catch (error) {
+      if (error instanceof BrowserUnavailableError) onUnavailable()
+      throw error
+    }
+    if (!fallback.shouldFallback(loaded)) {
+      if (loaded.status >= 200 && loaded.status < 300) return loaded
+      // A clean non-2xx page from the browser navigation: no point retrying.
+      throw new EngineSearchFailure('http', `HTTP ${loaded.status}`, loaded.status)
+    }
+    if (attempt === attempts - 1) {
+      // The last attempt still classified as a challenge wall: surface a
+      // structured failure instead of returning a page the caller would
+      // parse as "no results".
+      throw new EngineSearchFailure(
+        'challenge',
+        `browser search failed: every attempt answered with a challenge page (${url})`,
+      )
+    }
   }
-  throw new Error('browser search failed: every attempt answered with a challenge page')
+  throw new EngineSearchFailure('challenge', 'browser search failed: every attempt answered with a challenge page')
 }
 
 /** Fetch with a browser profile; escalate rejected/challenged responses to the real browser. */
@@ -130,12 +195,30 @@ export async function browserFetch(url: string, options: BrowserFetchOptions): P
   try {
     page = await fetchHtmlPage(url, options)
   } catch (error) {
+    // Cancellation is terminal — an aborted fetch must never escalate.
+    if (options.signal?.aborted) throw new EngineSearchFailure('canceled', 'aborted by caller')
     if (fallback === undefined || options.fetchImpl !== undefined) throw error
-    return browseHtmlPage(url, fallback, options.pageTimeoutMs ?? BROWSER_PAGE_TIMEOUT_MS, options.signal)
+    return browseHtmlPage(url, fallback, options.pageTimeoutMs ?? BROWSER_PAGE_TIMEOUT_MS, options.signal, (): never => {
+      // No browser to escalate a transport failure to: surface the original
+      // error so it keeps its retryable-transport classification.
+      throw error
+    })
   }
 
+  // A result that lands after the caller aborted is discarded, not parsed.
+  if (options.signal?.aborted) throw new EngineSearchFailure('canceled', 'aborted by caller')
   if (fallback === undefined || options.fetchImpl !== undefined) return page
   const isSuccessful = page.status >= 200 && page.status < 300
   if (isSuccessful && !fallback.shouldFallback(page)) return page
-  return browseHtmlPage(url, fallback, options.pageTimeoutMs ?? BROWSER_PAGE_TIMEOUT_MS, options.signal)
+  return browseHtmlPage(url, fallback, options.pageTimeoutMs ?? BROWSER_PAGE_TIMEOUT_MS, options.signal, (): never => {
+    // The trigger was a status/challenge, so the missing browser turns it into
+    // the structured failure it warrants (a 5xx stays `http`, not `challenge`).
+    if (fallback.shouldFallback(page)) {
+      throw new EngineSearchFailure(
+        'challenge',
+        `bot challenge (HTTP ${page.status}) and no browser service mounted to escalate`,
+      )
+    }
+    throw new EngineSearchFailure('http', `HTTP ${page.status}`, page.status)
+  })
 }

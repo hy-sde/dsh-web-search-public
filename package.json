@@ -31,8 +31,8 @@
     "test": "vitest run",
     "test:real": "vitest run --config vitest.real.config.ts",
     "lint:package": "publint",
-    "release:check": "bash ../scripts/release-public.sh dsh-web-search-public --check",
-    "release:publish": "bash ../scripts/release-public.sh dsh-web-search-public --publish",
+    "release:check": "bash ../scripts/release-public.sh --check dsh-web-search-public",
+    "release:publish": "bash ../scripts/release-public.sh --publish dsh-web-search-public",
     "prepack": "npm run clean && npm run build"
   },
   "engines": {

@@ -1,11 +1,13 @@
 /**
  * Provider-level tests: fan-out semantics (all engines queried concurrently,
- * consensus merge with engine-order tiebreak), deadline behavior (return at
- * soft deadline with success, wait past soft for the first success, hard cap
- * with zero successes), straggler abort, aggregate failure, per-engine circuit
- * breaker (hard 4xx trips, empty-streak trips, backoff doubling and recovery),
- * retry/cooldown policy, abort handling, availability, and a full plugin boot
- * against a stubbed fetch.
+ * consensus merge with engine-order tiebreak and one vote per canonical URL
+ * per engine), deadline behavior (return at the soft deadline with success,
+ * wait past soft for the first success, hard cap with zero successes, an
+ * overall deadline shared across retries), straggler abort, structured engine
+ * outcomes (accepted empties vs HTTP/challenge/transport failures), aggregate
+ * failure, per-engine circuit breaker (hard blocks and challenge walls trip,
+ * backoff doubling and recovery), retry/cooldown policy, abort and disposal
+ * draining, availability, and a full plugin boot against a stubbed fetch.
  * @module @hy-sde-org/dsh-web-search-public/tests/public
  */
 
@@ -15,7 +17,7 @@ import WebRuntime from '@deepseek-ai/dsh-web'
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import * as publicPlugin from '../src/index.ts'
 import { PUBLIC_PROVIDER_ID, PublicSearchProvider } from '../src/provider.ts'
-import type { PublicEngine, PublicEngineId } from '../src/types.ts'
+import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../src/types.ts'
 
 const startpageHome = [
   '<form>',
@@ -139,13 +141,20 @@ describe('PublicSearchProvider', () => {
     })
   })
 
-  it('keeps each engine result when engines do not overlap and caps to maxResults', async () => {
+  it('returns the full merged list and leaves truncation to the web seam', async () => {
     const first = stubEngine('startpage', { sources: [{ url: 'https://s.test/1', title: 'S One' }] })
     const second = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/2', title: 'D Two' }] })
     const result = await provider([first.engine, second.engine]).search({ query: 'q', maxResults: 1 })
-    // No consensus anywhere: ties break on best rank then engine order, and the
-    // provider caps the merged list to maxResults before returning.
-    expect(result.sources).toEqual([{ url: 'https://s.test/1', title: 'S One' }])
+    // No consensus anywhere: ties break on best rank then engine order. The
+    // provider returns the full merged list truncated:false — the web seam
+    // caps it to the request's maxResults and sets truncated:true itself.
+    expect(result).toEqual({
+      sources: [
+        { url: 'https://s.test/1', title: 'S One' },
+        { url: 'https://d.test/2', title: 'D Two' },
+      ],
+      truncated: false,
+    })
   })
 
   it('tolerates individual engine failures and returns the surviving results', async () => {
@@ -192,20 +201,20 @@ describe('PublicSearchProvider', () => {
       },
     }
     const result = await provider([hanging, empty.engine], { softDeadlineMs: 10, hardDeadlineMs: 40 }).search({ query: 'q' })
-    // Only `empty` settled with no results — not all engines failed (one is
-    // still in flight), so the aggregate returns what it has rather than
-    // throwing.
+    // `empty` accepted the search and legitimately found nothing — an accepted
+    // empty page, not a failure — while the other engine never settled, so the
+    // aggregate returns what it has rather than throwing.
     expect(result.sources).toEqual([])
   })
 
   it('aggregates failures into a WEB_PROVIDER_ERROR when every engine fails', async () => {
     const first = stubEngine('startpage', { error: new Error('HTTP 403') })
-    const second = stubEngine('mojeek', { sources: [] })
+    const second = stubEngine('mojeek', { error: new Error('HTTP 502') })
     const result = provider([first.engine, second.engine]).search({ query: 'q' })
     await expect(result).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
     await expect(result.catch((error: unknown) => error)).resolves.toMatchObject({
       code: 'WEB_PROVIDER_ERROR',
-      message: 'all public search engines failed: startpage: HTTP 403; mojeek: no results',
+      message: 'all public search engines failed: startpage: HTTP 403; mojeek: HTTP 502',
     })
   })
 
@@ -289,17 +298,16 @@ describe('PublicSearchProvider', () => {
     expect(blocked.calls).toHaveLength(2)
   })
 
-  it('does not retry or arm the cooldown when every engine returns no results', async () => {
+  it('returns [] without retrying when every engine accepts the search with zero results', async () => {
     const empty = stubEngine('mojeek', { sources: [] })
     const subject = provider([empty.engine], { maxRetries: 3, retryDelayMs: 2, failureCooldownMs: 100 })
-    await expect(subject.search({ query: 'gibberish' })).rejects.toMatchObject({
-      code: 'WEB_PROVIDER_ERROR',
-      message: 'all public search engines failed: mojeek: no results',
-    })
+    const result = await subject.search({ query: 'gibberish' })
+    // An accepted page with zero organic results is a legitimate empty answer,
+    // not an engine failure — no retry, no breaker trip, no cooldown.
+    expect(result).toEqual({ sources: [], truncated: false })
     expect(empty.calls).toHaveLength(1)
-    // First no-results search arms nothing (query-level), so the next search
-    // runs immediately.
-    await expect(subject.search({ query: 'other' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+    const again = await subject.search({ query: 'other' })
+    expect(again.sources).toEqual([])
     expect(empty.calls).toHaveLength(2)
   })
 
@@ -327,17 +335,21 @@ describe('PublicSearchProvider', () => {
     expect(healthy.calls).toHaveLength(2)
   })
 
-  it('trips an engine after consecutive empty responses and stops querying it', async () => {
-    const empty = stubEngine('duckduckgo', { sources: [] })
+  it('trips a challenge-walled engine and stops querying it', async () => {
+    const walled = stubEngine('duckduckgo', {
+      error: new EngineSearchFailure('challenge', 'bot challenge (HTTP 403) and no browser service mounted to escalate'),
+    })
     const healthy = stubEngine('startpage', { sources: [{ url: 'https://s.test/10', title: 'Alive' }] })
-    const subject = provider([empty.engine, healthy.engine], { engineBackoffMs: 5_000 })
-    await subject.search({ query: 'q' })
-    await subject.search({ query: 'q' })
-    expect(empty.calls).toHaveLength(2)
-    const third = await subject.search({ query: 'q' })
-    expect(third.sources).toEqual([{ url: 'https://s.test/10', title: 'Alive' }])
-    // The second empty opened the streak breaker: the third search skipped it.
-    expect(empty.calls).toHaveLength(2)
+    const subject = provider([walled.engine, healthy.engine], { engineBackoffMs: 5_000 })
+    const first = await subject.search({ query: 'q' })
+    expect(first.sources).toEqual([{ url: 'https://s.test/10', title: 'Alive' }])
+    expect(walled.calls).toHaveLength(1)
+    const second = await subject.search({ query: 'q' })
+    expect(second.sources).toEqual([{ url: 'https://s.test/10', title: 'Alive' }])
+    // The challenge classified as a hard block: the breaker is open, the
+    // engine is skipped without another request.
+    expect(walled.calls).toHaveLength(1)
+    expect(healthy.calls).toHaveLength(2)
   })
 
   it('probes a tripped engine after the backoff and resets the window on success', async () => {
@@ -393,6 +405,126 @@ describe('PublicSearchProvider', () => {
     // Breaker disabled: the 403 engine is still queried on every search.
     expect(blocked.calls).toHaveLength(2)
   })
+
+  it('counts engines still in flight at the hard deadline as failed', async () => {
+    const first: PublicEngine = {
+      id: 'startpage',
+      async search(): Promise<WebSearchSource[]> {
+        return new Promise(() => {}) // never settles, ignores abort
+      },
+    }
+    const second: PublicEngine = {
+      id: 'duckduckgo',
+      async search(): Promise<WebSearchSource[]> {
+        return new Promise(() => {})
+      },
+    }
+    await expect(provider([first, second], { softDeadlineMs: 10, hardDeadlineMs: 40 }).search({ query: 'q' }))
+      .rejects.toMatchObject({
+        code: 'WEB_PROVIDER_ERROR',
+        message:
+          'all public search engines failed: startpage: did not settle before the hard deadline; duckduckgo: did not settle before the hard deadline',
+      })
+  })
+
+  it('spends the aggregate deadline across retries instead of restarting it', async () => {
+    const slow = stubEngine('mojeek', { error: new Error('HTTP 502'), delayMs: 25 })
+    const subject = provider([slow.engine], { maxRetries: 1, retryDelayMs: 5, softDeadlineMs: 5, hardDeadlineMs: 15 })
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_ERROR',
+      message: /did not settle before the hard deadline/,
+    })
+    // The retry guard saw the deadline spent: no second attempt went out.
+    expect(slow.calls).toHaveLength(1)
+  })
+
+  it('returns [] when one engine fails and another accepts the search with zero results', async () => {
+    const blocked = stubEngine('startpage', { error: new Error('HTTP 403') })
+    const empty = stubEngine('duckduckgo', { sources: [] })
+    const result = await provider([blocked.engine, empty.engine]).search({ query: 'q' })
+    // The accepted empty page is a legitimate answer, not an aggregate failure.
+    expect(result).toEqual({ sources: [], truncated: false })
+  })
+
+  it('counts one vote per canonical URL within a single engine answer', async () => {
+    const variants = stubEngine('startpage', { sources: [
+      { url: 'https://example.com/shared', title: 'Shared', snippet: 'best-ranked snippet' },
+      { url: 'https://www.example.com/shared/', title: 'Shared (www variant)', snippet: 'later variant snippet' },
+    ] })
+    const other = stubEngine('duckduckgo', { sources: [{ url: 'https://example.com/shared', title: 'Shared (ddg)' }] })
+    const result = await provider([variants.engine, other.engine]).search({ query: 'q' })
+    // URL variants inside ONE engine answer collapse to a single consensus
+    // vote (the best-ranked variant wins); the cross-engine vote still merges.
+    expect(result.sources).toEqual([
+      { url: 'https://example.com/shared', title: 'Shared', snippet: 'best-ranked snippet' },
+    ])
+  })
+
+  it('retries a structured HTTP 5xx failure but not a structured 4xx', async () => {
+    let calls = 0
+    const flaky: PublicEngine = {
+      id: 'mojeek',
+      async search(): Promise<WebSearchSource[]> {
+        calls += 1
+        if (calls === 1) throw new EngineSearchFailure('http', 'HTTP 503', 503)
+        return [{ url: 'https://m.test/15', title: 'Recovered' }]
+      },
+    }
+    const result = await provider([flaky], { maxRetries: 1, retryDelayMs: 5 }).search({ query: 'q' })
+    expect(calls).toBe(2)
+    expect(result.sources).toEqual([{ url: 'https://m.test/15', title: 'Recovered' }])
+  })
+
+  it('trips the breaker on a structured HTTP 4xx without retrying', async () => {
+    const blocked = stubEngine('mojeek', { error: new EngineSearchFailure('http', 'HTTP 403', 403) })
+    const subject = provider([blocked.engine], {
+      maxRetries: 3,
+      retryDelayMs: 2,
+      failureCooldownMs: 0,
+      engineBackoffMs: 5_000,
+    })
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_ERROR',
+      message: 'all public search engines failed: mojeek: HTTP 403',
+    })
+    expect(blocked.calls).toHaveLength(1)
+    // The breaker is open on the next search: the engine is skipped outright.
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_ERROR',
+      message: /skipped \(recent failures: HTTP 403\)/,
+    })
+    expect(blocked.calls).toHaveLength(1)
+  })
+
+  it('aborts in-flight searches, drains them, and refuses new work once disposed', async () => {
+    let observedAbort = false
+    let slowCalls = 0
+    const slow: PublicEngine = {
+      id: 'startpage',
+      async search(_request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+        slowCalls += 1
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 5_000)
+          signal?.addEventListener('abort', () => { observedAbort = true; clearTimeout(timer); resolve() }, { once: true })
+        })
+        return [{ url: 'https://s.test/16', title: 'Late' }]
+      },
+    }
+    const healthy = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/17', title: 'Quick' }] })
+    const subject = provider([slow, healthy.engine])
+    const pending = subject.search({ query: 'q' })
+    await vi.waitFor(() => { expect(slowCalls).toBe(1) })
+    const draining = subject.dispose()
+    // The in-flight search is aborted and settles as WEB_ABORTED…
+    await expect(pending).rejects.toMatchObject({ code: 'WEB_ABORTED' })
+    // …and dispose() only resolves once the drained searches settled.
+    await draining
+    expect(observedAbort).toBe(true)
+    await expect(subject.search({ query: 'q' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_UNAVAILABLE',
+      message: /disposed/,
+    })
+  })
 })
 
 describe('plugin boot', () => {
@@ -411,7 +543,8 @@ describe('plugin boot', () => {
       } else if (url.includes('html.duckduckgo.com')) {
         body = ddgPage
       } else if (url.includes('ecosia.org') || url.includes('google.com') || url.includes('mojeek.com')) {
-        // Bot-challenged pages parse to zero results; the fan-out tolerates them.
+        // Pages without challenge markers parse to zero organic results —
+        // accepted as legitimate empties by the fan-out.
         body = '<html><body>empty</body></html>'
       } else {
         throw new Error(`unexpected fetch: ${url}`)

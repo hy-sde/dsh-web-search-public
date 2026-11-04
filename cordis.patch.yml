@@ -4,10 +4,25 @@
 # soft/hard deadlines. It needs no API key and no fetch provider. The keyed
 # DeepSeek route (web-search-deepseek) is left untouched, so deployments that
 # explicitly choose their own provider via `web.searchProvider` keep that choice.
+#
+# The Loader replaces a targeted row's fields wholesale — `config` is never
+# deep-merged — so both keys are restated: `searchProvider` selects the public
+# fan-out, `fetchProvider` keeps the base bundle's SSRF-guarded anonymous fetch.
 - id: web
   config:
     searchProvider: public
+    fetchProvider: http
+
+# Harnesses that already mount the bundled web-search-public row (deepseek-harness
+# base bundle mounts @deepseek-ai/dsh-web-search-public) must not load this package
+# twice — both register the provider id `public`, and the second registration would
+# fail boot. Disable the bundled row (a no-op patch on harnesses that lack it) and
+# mount this package under a distinct row id: an override cannot rename a row's
+# package, because a truthy `name` asserts the existing plugin name rather than
+# renaming it.
+- id: web-search-public
+  disabled: true
 
 - insert:
-    - id: web-search-public
+    - id: web-search-public-npm
       name: '@hy-sde-org/dsh-web-search-public'

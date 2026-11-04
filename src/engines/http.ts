@@ -3,6 +3,8 @@
  * @module @hy-sde-org/dsh-web-search-public/engines/http
  */
 
+import { EngineSearchFailure } from '../types.ts'
+
 export interface FetchHtmlOptions {
   url: string
   method?: 'GET' | 'POST'
@@ -17,8 +19,10 @@ export interface FetchHtmlOptions {
 /**
  * Fetch and return the response body text. Redirects are rejected before any
  * `Location` target is contacted (the web-package AGENTS.md rule); a non-2xx
- * response fails. Errors carry a short human-readable message for the chain's
- * failure aggregate.
+ * response fails with an {@link EngineSearchFailure} carrying the status (4xx
+ * hard-blocks that engine, 5xx is retryable). Redirect rejections and network
+ * failures propagate as `TypeError`s — the provider's legacy signatures
+ * classify them as retryable transport problems.
  */
 export async function fetchHtml(options: FetchHtmlOptions): Promise<string> {
   const headers: Record<string, string> = {
@@ -34,6 +38,6 @@ export async function fetchHtml(options: FetchHtmlOptions): Promise<string> {
   if (options.body !== undefined) init.body = options.body
   if (options.signal !== undefined) init.signal = options.signal
   const response = await fetch(options.url, init)
-  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  if (!response.ok) throw new EngineSearchFailure('http', `HTTP ${response.status}`, response.status)
   return await response.text()
 }

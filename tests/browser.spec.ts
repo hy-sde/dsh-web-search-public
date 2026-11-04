@@ -1,12 +1,20 @@
 /**
  * Unit tests for the browser-profiled transport (omp-ported escalation):
  * header coherence, fetch-first behavior, challenge/4xx escalation to the
- * injected page scraper, retry loops, and fetch-only mode without a scraper.
+ * injected page scraper, retry loops, fetch-only mode without a scraper, and
+ * the structured terminal outcomes (canceled/transport/http/challenge) with
+ * abort-guarded escalation.
  * @module @hy-sde-org/dsh-web-search-public/tests/browser
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { browserFetch, BROWSER_PAGE_TIMEOUT_MS, type LoadedHtmlPage, type PageScraper } from '../src/engines/browser-page.ts'
+import {
+  BrowserUnavailableError,
+  browserFetch,
+  BROWSER_PAGE_TIMEOUT_MS,
+  type LoadedHtmlPage,
+  type PageScraper,
+} from '../src/engines/browser-page.ts'
 import { buildBrowserNavigationHeaders } from '../src/engines/browser-headers.ts'
 
 const UA =
@@ -53,6 +61,9 @@ describe('browserFetch', () => {
     blockedScraperCalls.push(url)
     return { html: SERP, status: 200, url }
   }
+  // Challenge walls don't carry the SERP markup: classify by content so a
+  // rendered SERP counts as clean (the escalation must land a clean page).
+  const notSerp = (page: LoadedHtmlPage): boolean => !page.html.includes('<div id="search">')
 
   it('returns the plain fetch page without touching the browser when clean', async () => {
     const fetch = fetchMock()
@@ -72,7 +83,7 @@ describe('browserFetch', () => {
     fetch.mockResolvedValue(new Response('sorry', { status: 403 }))
     const page = await browserFetch('https://www.google.com/search?q=x', {
       userAgent: UA,
-      browser: { scrape: challengeScraper, homeUrl: 'https://www.google.com/', shouldFallback: () => true },
+      browser: { scrape: challengeScraper, homeUrl: 'https://www.google.com/', shouldFallback: notSerp },
     })
     expect(page.html).toBe(SERP)
     expect(blockedScraperCalls).toEqual(['https://www.google.com/search?q=x'])
@@ -84,7 +95,7 @@ describe('browserFetch', () => {
     const page = await browserFetch('https://www.google.com/search?q=x', {
       userAgent: UA,
       referer: 'https://www.google.com/',
-      browser: { scrape: challengeScraper, shouldFallback: () => true },
+      browser: { scrape: challengeScraper, shouldFallback: notSerp },
     })
     expect(page.html).toBe(SERP)
     const [, init] = fetch.mock.calls[0]!
@@ -97,7 +108,7 @@ describe('browserFetch', () => {
     fetch.mockRejectedValue(new Error('ECONNRESET'))
     const page = await browserFetch('https://www.google.com/search?q=x', {
       userAgent: UA,
-      browser: { scrape: challengeScraper, shouldFallback: () => true },
+      browser: { scrape: challengeScraper, shouldFallback: notSerp },
     })
     expect(page.html).toBe(SERP)
   })
@@ -123,15 +134,14 @@ describe('browserFetch', () => {
     expect(scrape).toHaveBeenCalledTimes(2)
   })
 
-  it('returns the last attempt when all browser attempts are blocked (no infinite loop)', async () => {
+  it('rejects with a challenge failure when every browser attempt is blocked', async () => {
     const fetch = fetchMock()
     fetch.mockResolvedValue(okResponse('<div>problem</div>'))
     const scrape = vi.fn(async () => ({ html: '<div>altcha-widget</div>', status: 200, url: 'u' }))
-    const page = await browserFetch('https://www.mojeek.com/search?q=x', {
+    await expect(browserFetch('https://www.mojeek.com/search?q=x', {
       userAgent: UA,
       browser: { scrape, shouldFallback: () => true, attempts: 2, retryDelayMs: 1 },
-    })
-    expect(page.html).toBe('<div>altcha-widget</div>')
+    })).rejects.toThrow('browser search failed: every attempt answered with a challenge page')
     expect(scrape).toHaveBeenCalledTimes(2)
   })
 
@@ -151,8 +161,72 @@ describe('browserFetch', () => {
     }
     await browserFetch('https://www.ecosia.org/search?q=x', {
       userAgent: UA,
-      browser: { scrape, shouldFallback: () => true },
+      browser: { scrape, shouldFallback: notSerp },
     })
     expect(seen).toBe(BROWSER_PAGE_TIMEOUT_MS)
+  })
+
+  it('never escalates an aborted fetch and discards a page that lands after abort', async () => {
+    const fetch = fetchMock()
+    fetch.mockRejectedValue(new Error('ECONNRESET'))
+    const scrape = vi.fn(async () => ({ html: SERP, status: 200, url: 'u' }))
+    const controller = new AbortController()
+    controller.abort()
+    await expect(browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+      signal: controller.signal,
+      browser: { scrape, shouldFallback: () => true },
+    })).rejects.toThrow('aborted by caller')
+    expect(scrape).not.toHaveBeenCalled()
+    // A page that lands despite the abort is discarded, not parsed.
+    fetch.mockResolvedValue(okResponse(SERP))
+    await expect(browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+      signal: controller.signal,
+      browser: { scrape, shouldFallback: () => false },
+    })).rejects.toThrow('aborted by caller')
+  })
+
+  it('re-surfaces the original transport error when the browser service is unavailable', async () => {
+    const fetch = fetchMock()
+    fetch.mockRejectedValue(new Error('ECONNRESET'))
+    const scrape = vi.fn(async () => { throw new BrowserUnavailableError() })
+    await expect(browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+      browser: { scrape, shouldFallback: () => true },
+    })).rejects.toThrow('ECONNRESET')
+    // A challenge/status trigger classifies as a challenge instead.
+    fetch.mockResolvedValue(new Response('sorry', { status: 403 }))
+    await expect(browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+      browser: { scrape, shouldFallback: () => true },
+    })).rejects.toMatchObject({ kind: 'challenge' })
+    expect(scrape).toHaveBeenCalledTimes(2)
+  })
+
+  it('throws an http failure for a clean non-2xx page from the browser navigation', async () => {
+    const fetch = fetchMock()
+    fetch.mockResolvedValue(new Response('down', { status: 503 }))
+    const scrape = vi.fn(async () => ({ html: '<div>down</div>', status: 503, url: 'u' }))
+    await expect(browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+      browser: { scrape, shouldFallback: () => false },
+    })).rejects.toMatchObject({ kind: 'http' })
+  })
+
+  it('classifies a rejected redirect as a retryable transport failure', async () => {
+    const fetch = fetchMock()
+    fetch.mockRejectedValue(new TypeError('Unexpected redirect'))
+    await expect(browserFetch('https://www.google.com/search?q=x', { userAgent: UA }))
+      .rejects.toMatchObject({ kind: 'transport' })
+  })
+
+  it('returns a non-2xx page as-is when fetchImpl is injected (test seam)', async () => {
+    const page = await browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+      fetchImpl: (async () => new Response('sorry', { status: 403 })) as typeof fetch,
+      browser: { scrape: challengeScraper, shouldFallback: () => true },
+    })
+    expect(page.status).toBe(403)
   })
 })

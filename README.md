@@ -37,13 +37,13 @@ never pin a search to the tool budget.
 ## Prerequisites
 
 - Node.js 22.19 or newer with npm and pnpm on `PATH`;
-- DeepSeek Harness `0.2.0-rc.2` including the standard `dsh` CLI;
+- DeepSeek Harness `0.2.1-rc.5` including the standard `dsh` CLI;
 - no API keys — nothing else.
 
 Install the Harness CLI and pnpm before continuing:
 
 ```bash
-npm install --global @deepseek-ai/dsh@0.2.0-rc.2 pnpm
+npm install --global @deepseek-ai/dsh@0.2.1-rc.5 pnpm
 dsh --version
 ```
 
@@ -76,8 +76,9 @@ path — always install the built tarball (or the published package).
 dsh web --dump-config
 ```
 
-The composed tree must show `web.config.searchProvider: public` and a `web-search-public`
-plugin row loading `@hy-sde-org/dsh-web-search-public`.
+The composed tree must show `web.config.searchProvider: public` and a `web-search-public-npm`
+plugin row loading `@hy-sde-org/dsh-web-search-public` (on harnesses that ship the bundled
+provider, the bundled `web-search-public` row shows as disabled).
 
 ### Run
 
@@ -95,23 +96,28 @@ dsh plugin --profile web remove @hy-sde-org/dsh-web-search-public
 ```
 
 > **Already shipped?** If your harness checkout already mounts `web-search-public` in its base
-> bundle (a recent release adopted this package as the shipped default), skip installation
-> — it is already the active provider. Adding this bundle on top would duplicate the loader
-> row and fail at boot (“duplicate loader entry id”).
+> bundle (a recent release adopted this provider as the shipped default), you can still install
+> this package — the patch disables the bundled row and mounts this package under a distinct
+> row id (`web-search-public-npm`), so the provider id `public` is registered exactly once.
 
 ## What the bundle does
 
 The package declares a DSH bundle (`dsh.bundle.patch` → `cordis.patch.yml`), so `dsh plugin`
 installs it and applies its patch layer to the profile:
 
-1. sets `web.config.searchProvider` to `public` (making the credential-free fan-out the default),
-2. inserts the `web-search-public` plugin row.
+1. overrides the `web` row with `config: { searchProvider: public, fetchProvider: http }` —
+   the Loader replaces a row's config wholesale, so both keys are restated (the base bundle's
+   `fetchProvider: http` is preserved, not dropped),
+2. disables the bundled `web-search-public` row when the harness ships one (a no-op patch on
+   harnesses without it), and
+3. inserts this package as the `web-search-public-npm` plugin row.
 
 The keyed DeepSeek route (`web-search-deepseek`, provider id `deepseek-official`) is **not**
 disabled — deployments that prefer it keep their explicit choice by setting
 `web.searchProvider: deepseek-official` and providing the `DEEPSEEK_API_KEY` credential.
-No fetch provider is mounted and `tool-web` keeps `fetch: false`: the model can search, not
-fetch arbitrary URLs, which defers SSRF exposure entirely.
+This bundle mounts no fetch provider of its own and changes no `tool-web` settings; whether
+the model can fetch arbitrary URLs is decided by the `tool-web` row of your composition (the
+shipped harness base keeps `fetch: false`).
 
 ## How the fan-out works
 
@@ -125,37 +131,50 @@ fetch arbitrary URLs, which defers SSRF exposure entirely.
          └────────────► consensus merge ◄────────────────┘
 ```
 
-- Every engine is asked in parallel. The race returns at the **earliest** of: all engines
-  settled, the **soft deadline** (5 s default) with at least one success in hand, or the
-  **hard deadline** (30 s default) regardless — then aborts every still-running engine.
-  If the soft deadline passes with no success yet and not everything has failed, the call
-  keeps waiting up to the hard deadline for the first success.
+- Every engine is asked in parallel under one **overall hard deadline** shared by all retry
+  attempts. The race returns at the **earliest** of: all engines settled, the **soft deadline**
+  (5 s default) with at least one success in hand, or the **hard deadline** (30 s default)
+  regardless — then aborts every still-running engine. If the soft deadline passes with no
+  success yet and something is still in flight, the call keeps waiting up to the hard deadline
+  for the first success.
 - Sources are deduplicated across engines (case/`www.`/trailing-slash-normalized URLs) and
-  ranked by **cross-engine consensus** — how many engines returned a URL — then best rank,
-  then engine order. The most informative snippet wins; the earlier engine’s title/URL win
-  equal-rank ties.
+  ranked by **cross-engine consensus** — how many engines returned a URL, counting one vote
+  per engine even when one engine's answer contains several URL variants of the same page —
+  then best rank, then engine order. The most informative snippet wins; the earlier engine’s
+  title/URL win equal-rank ties. The provider returns the full merged list; the web seam caps
+  it to the request's `maxResults` and sets `truncated` itself.
 - Each engine still runs under its own `AbortSignal.timeout(timeoutMs)` race, so an engine
   that ignores the aggregate’s cancellation dies at its own cap.
-- **Rate-limit resilience is best-effort, layered.** A hard block (HTTP 4xx) or
-  a zero-result page repeated on consecutive searches opens *that engine’s* circuit breaker:
-  it is skipped for `engineBackoffMs` (5 min default, doubling per consecutive trip up to
-  `maxEngineBackoffMs`), with no request sent, and probed again after the window. Retryable
-  transport failures (HTTP 5xx, timeout, network fetch failure) retry the whole fan-out after
-  an exponential backoff (`maxRetries`/`retryDelayMs`, abort-aware sleep); hard blocks are
-  never retried. Once retries are exhausted — or every engine is down — the provider
-  fast-fails for `failureCooldownMs` (5 min default) with a `retry in about Ns` error instead
-  of re-blasting engines that just throttled us (which would deepen the block). A pure
-  all-`no results` aggregate is query-level and is never retried or cooled down.
+- **Rate-limit resilience is best-effort, layered, and verdict-driven.** Engine outcomes are
+  classified — accepted page (with or without results), challenge wall, HTTP status, transport
+  failure, timeout, or canceled. A challenge wall, an HTTP 4xx, or an engine still pending at
+  the hard deadline opens *that engine’s* circuit breaker: it is skipped for `engineBackoffMs`
+  (5 min default, doubling per consecutive trip up to `maxEngineBackoffMs`), with no request
+  sent, and probed again after the window. Retryable transport failures (HTTP 5xx, timeout,
+  network fetch failure) retry the whole fan-out after an exponential backoff
+  (`maxRetries`/`retryDelayMs`, abort-aware sleep); hard blocks are never retried. Once retries
+  are exhausted — or every engine is down — the provider fast-fails for `failureCooldownMs`
+  (5 min default) with a `retry in about Ns` error instead of re-blasting engines that just
+  throttled us (which would deepen the block). An accepted zero-result page is a query-level
+  verdict: it is returned as `[]` and neither retried nor cooled down, and it never trips the
+  breaker (an obscure query must not disable an engine).
 
-- `available()` is `true` whenever at least one engine is configured — the provider is always
-  usable, which is the point.
+- Unloading the plugin aborts in-flight searches and drains them before unload completes
+  (a disposed provider answers new searches with `WEB_PROVIDER_UNAVAILABLE`).
+- A caller abort (`signal.aborted`) aborts the fan-out and throws `WEB_ABORTED`; an aborted
+  fetch never escalates to the browser.
+- Only if **no engine produced an accepted page** does the provider throw `WEB_PROVIDER_ERROR`
+  with each engine’s reason (`id: <reason>; …`) — engines that were still running at the hard
+  deadline are listed as `did not settle before the hard deadline`. If at least one engine
+  accepted the search and found nothing, the call succeeds with `[]` (`truncated: false`).
 - A caller abort (`signal.aborted`) aborts the fan-out and throws `WEB_ABORTED`.
 - Only if **every** engine fails does the provider throw `WEB_PROVIDER_ERROR` with each
   engine’s reason (`id: <reason>; …`). Zero organic results, a timed-out engine, and a failed
   HTTP request all count as “this engine has nothing” and are absorbed by the merge.
 
-The worst case for the default configuration is ≈ `hardDeadlineMs` (30 s), well under the
-60-second search budget `dsh-tool-web` books in the shipped harness bundle.
+The worst case for the default configuration is ≈ `hardDeadlineMs` (30 s) overall — the
+deadline is the whole budget for the search including retries and their backoff — well under
+the 60-second search budget `dsh-tool-web` books in the shipped harness bundle.
 
 ### Browser escalation (bot walls)
 
@@ -170,9 +189,12 @@ ALTCHA auto-solve (force-click of the shadow-DOM checkbox + PoW redirect wait, o
 `solveCaptcha`). The circuit breaker only opens when every transport — fetch *and* browser —
 is blocked.
 
-Escalation is optional: mount the `browser` service row **before** this provider and the
-browser-backed engines light up; without it they stay fetch-only (original behavior), and
-`timeoutMs` (default 30 s) is the per-engine budget that covers fetch → browser steps.
+Escalation resolves the `browser` service lazily at the first challenged fetch, so mount order
+never matters — a browser row mounted later still lights the browser-backed engines up. When
+no browser service is mounted at escalation time, a challenge trigger is classified as a
+challenge (and trips that engine's breaker honestly) while a transport trigger keeps its
+retryable classification. `timeoutMs` (default 30 s) is the per-engine budget that covers
+fetch → browser steps.
 
 ## Configuration
 
@@ -181,14 +203,14 @@ All options are optional; constants fill the defaults. Configure via the plugin 
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `engines` | `startpage, duckduckgo, ecosia, google, mojeek` | engine ids the fan-out races; this order is the tiebreak for consensus ties; unlisted engines stay disabled |
+| `engines` | `startpage, duckduckgo, ecosia, google, mojeek` | engine ids the fan-out races; this order is the tiebreak for consensus ties; unlisted engines stay disabled; an explicit empty array is rejected at activation — omit the key for the default set |
 | `timeoutMs` | `30000` | per-engine transport timeout (ms): bounds one engine even if it ignores aggregate cancellation; browser-backed engines may spend it on fetch → stealth-browser escalation, so the default is 30 s |
 | `softDeadlineMs` | `5000` | soft aggregate deadline — return as soon as all engines settled or this passes with ≥1 success |
-| `hardDeadlineMs` | `30000` | hard aggregate deadline — return whatever we have, even nothing; must be ≥ `softDeadlineMs` |
+| `hardDeadlineMs` | `30000` | hard aggregate deadline — the overall budget across retries and their backoff; past it the call returns whatever it has, even nothing; must be ≥ `softDeadlineMs` |
 | `maxRetries` | `1` | retries for the all-engines-failed aggregate when at least one engine died from a *retryable* transport failure (HTTP 5xx, a timeout, or a network fetch failure). Each retry re-runs the whole fan-out after a backoff, so a short engine throttle that strips the first attempt still yields results. `0` disables retrying. Hard blocks (HTTP 4xx) are never retried — they open that engine’s circuit breaker — and a pure all-`no results` aggregate is query-level and never retried. |
 | `retryDelayMs` | `2000` | base delay before retry #1 (ms); doubles on each subsequent attempt. |
 | `failureCooldownMs` | `300000` | fast-fail window (ms) after an all-engines-down failure (retry exhausted, or every engine hard-blocked/tripped): searches in this window return a clear `retry in about Ns` error instead of re-blasting engines that just throttled us (which would deepen the block). `0` disables the window. |
-| `engineBackoffMs` | `300000` | base per-engine circuit-breaker window (ms): an engine that hard-blocks (HTTP 4xx) or returns no results on consecutive searches is skipped for this long instead of being re-blasted on every search. Doubles per consecutive trip up to `maxEngineBackoffMs`; resets after a successful probe. `0` disables the per-engine breaker. |
+| `engineBackoffMs` | `300000` | base per-engine circuit-breaker window (ms): an engine that hard-blocks (HTTP 4xx), answers with a challenge wall, or is still pending at the hard deadline is skipped for this long instead of being re-blasted on every search. Doubles per consecutive trip up to `maxEngineBackoffMs`; resets after a successful probe. `0` disables the per-engine breaker. |
 | `maxEngineBackoffMs` | `3600000` | cap for the doubled per-engine circuit-breaker window (ms). |
 | `userAgent` | browser-shaped constant | User-Agent sent to the engines (deliberately not the product UA) |
 
@@ -208,8 +230,8 @@ All options are optional; constants fill the defaults. Configure via the plugin 
 ```
 
 `PublicEngineId` values are the exported engine ids; any id outside the known set is dropped
-at startup, and a zero-engine config makes `available()` false (surfacing
-`WEB_PROVIDER_CONFIGURED_UNAVAILABLE`).
+at startup, and an `engines: []` config is rejected at activation with a clear message —
+omit the key for the default set (a provider with no engines would be unusable).
 
 ## Errors
 
@@ -236,12 +258,17 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
   (up to 5 anonymous scrapes per query). That is the price of resilience and consensus, and
   it raises bot-challenge / rate-limit exposure compared with a single-engine chain — see
   [docs/operations.md](docs/operations.md).
-- **No fetch provider.** `tool-web` `fetch: false` stays: the model cannot be pointed at
-  arbitrary URLs, so SSRF and unsafe-content surfaces stay closed.
-- **Redirect policy.** All engine fetches use `redirect: "error"` — redirects are treated as
-  failures and absorbed by the merge rather than leak the caller onto an external location.
+- **No fetch provider of our own.** This bundle mounts no fetch provider and changes no
+  `tool-web` settings; the shipped harness base keeps `tool-web` `fetch: false`, so the model
+  cannot be pointed at arbitrary URLs and SSRF surfaces stay closed.
+- **Redirect policy is per-transport.** The plain-fetch legs of every engine use
+  `redirect: "error"` — a redirect is rejected before any `Location` target is contacted.
+  When a challenge triggers escalation, the real browser then navigates like a browser and
+  follows redirects; the escalated navigation stays inside the engine's own home/results
+  hosts.
 - **Challenges are expected.** Startpage, Ecosia, and Google frequently serve bot checks;
-  the parsers treat challenged pages as zero results and the fan-out tolerates them. See
+  challenge pages are classified as structured `challenge` failures (they trip that engine's
+  breaker and are absorbed by the fan-out), never parsed as zero results. See
   [docs/operations.md](docs/operations.md) for runtime expectations.
 
 ## Compatibility
@@ -249,7 +276,7 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
 | Component | Supported contract |
 | --- | --- |
 | Node.js | 22.19 or newer |
-| DeepSeek Harness | `0.2.0-rc.2` (`@deepseek-ai/dsh-web`, `@deepseek-ai/cordis` peer range) |
+| DeepSeek Harness | `0.2.1-rc.5` (`@deepseek-ai/dsh-web ^0.2.1-rc.5`, `@deepseek-ai/cordis` peer range) |
 | Seam | `ctx.web` `WebSearchProvider` (no key, no fetch provider) |
 
 The provider implements only the `WebSearchProvider` seam contract; the model-facing tool is

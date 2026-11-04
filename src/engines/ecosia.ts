@@ -67,7 +67,11 @@ export function parseEcosia(html: string, limit: number): WebSearchSource[] {
   for (let i = 0; i < links.length && sources.length < limit; i += 1) {
     const link = links[i]
     if (link === undefined) continue
-    const snippetTag = snippetTags[i]
+    // Pair each link with the snippet tag that follows it and precedes the
+    // next result link — pairing the two lists by position mis-attributes
+    // snippets whenever any result lacks one.
+    const windowEnd = links[i + 1]?.start ?? doc.length
+    const snippetTag = snippetTags.find(tag => tag.start >= link.start && tag.start < windowEnd)
     const snippet = snippetTag === undefined ? undefined : elementText(doc, snippetTag)
     sources.push({
       url: link.href,

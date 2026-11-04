@@ -35,9 +35,40 @@ export interface PublicEngine {
   readonly id: PublicEngineId
   /**
    * Execute one search.
-   * @throws Error with a human-readable message on transport or parse failure.
+   * @throws {@link EngineSearchFailure} with a structured `kind` when the
+   * failure is classifiable (challenge wall, HTTP status, transport problem,
+   * cancellation); plain `Error`s from third-party engines fall back to the
+   * provider's legacy message signatures.
    */
   search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]>
+}
+
+/**
+ * Structured failure kinds an engine transport can surface. They replace
+ * message-regex classification: `challenge` marks an anti-bot wall (trips the
+ * engine's circuit breaker immediately), `http` carries the status (4xx is a
+ * hard block, 5xx is retryable), `transport` is a network-level failure
+ * (retryable), and `canceled` is a caller or aggregate abort (ignored by the
+ * aggregate — not an engine failure).
+ */
+export type EngineFailureKind = 'challenge' | 'http' | 'transport' | 'canceled'
+
+/**
+ * Error an engine raises when the failure kind is known structurally. The
+ * provider maps it onto the matching attempt outcome without message
+ * sniffing; unknown errors keep the legacy signature fallback.
+ */
+export class EngineSearchFailure extends Error {
+  readonly kind: EngineFailureKind
+  /** HTTP status when `kind === 'http'`. */
+  readonly status?: number
+
+  constructor(kind: EngineFailureKind, message: string, status?: number) {
+    super(message)
+    this.name = 'EngineSearchFailure'
+    this.kind = kind
+    if (status !== undefined) this.status = status
+  }
 }
 
 /**

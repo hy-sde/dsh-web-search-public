@@ -84,7 +84,9 @@ export function parseGoogle(html: string, limit: number): WebSearchSource[] {
 
   // Organic results are anchors wrapping an `<h3>`; ad and navigation noise is
   // filtered by requiring an `h3` child and a usable href.
-  const organic: { href: string; title: string }[] = []
+  // Each organic entry remembers its anchor's offset so snippets can be
+  // paired by POSITION IN THE PAGE, not by list index.
+  const organic: { href: string; title: string; index: number }[] = []
   for (const match of region.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/g)) {
     const inner = match[2] ?? ''
     if (!/<h3[\s>]/i.test(inner)) continue
@@ -93,7 +95,7 @@ export function parseGoogle(html: string, limit: number): WebSearchSource[] {
     if (href === undefined) continue
     const title = cleanText(inner)
     if (title.length === 0) continue
-    organic.push({ href, title })
+    organic.push({ href, title, index: match.index })
   }
 
   const snippetTags = elementsByClass(region, 'VwiC3b', 'div')
@@ -101,7 +103,11 @@ export function parseGoogle(html: string, limit: number): WebSearchSource[] {
   for (let i = 0; i < organic.length && sources.length < limit; i += 1) {
     const result = organic[i]
     if (result === undefined) continue
-    const snippetTag = snippetTags[i]
+    // Pair each result with the snippet tag that follows its own anchor and
+    // precedes the next organic anchor. Pairing the two lists by position
+    // mis-attributes snippets whenever any result lacks one.
+    const windowEnd = organic[i + 1]?.index ?? region.length
+    const snippetTag = snippetTags.find(tag => tag.start >= result.index && tag.start < windowEnd)
     const snippet = snippetTag === undefined ? undefined : elementText(region, snippetTag)
     sources.push({
       url: result.href,

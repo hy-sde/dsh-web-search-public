@@ -74,17 +74,23 @@ dsh web --dump-config
 
 - Keep the provider credential-free. Never add an API-key path, even as a fallback.
 - Keep the fan-out concurrent and consensus-ranked (a faithful port of oh-my-pi
-  `searchPublicWeb`): zero results, a timed-out engine, and a failed request are absorbed by
-  the merge; only an all-engine failure may throw, and the call is always bounded by the
-  soft/hard deadline pair.
+  `searchPublicWeb`): a query-level zero-result page, a timed-out engine, and a failed
+  request are absorbed by the merge; only an all-engine failure may throw, and the whole
+  search — retries and backoff included — is bounded by the soft/hard deadline pair, where
+  the hard deadline is the overall budget.
 - Keep every engine secret-free and header-lean: the browser-shaped `userAgent` constant and
   an `accept` header, nothing more.
-- Keep parsers tolerant: a challenged or redesigned page must parse to zero organic results,
-  never throw into the merge.
+- Keep parsers tolerant: a redesigned page must parse to zero organic results, never throw
+  into the merge; an unrecognizable wall is indistinguishable from an empty page.
+- Classify failures, never regex them away: a recognizable challenge wall is a structured
+  `challenge` outcome (it trips that engine's breaker instead of poisoning the merge with an
+  empty vote), HTTP statuses carry their code, and an accepted empty page is a query-level
+  verdict that returns `[]` without arming the cooldown.
 - Keep tests fixture-based; the live suite is opt-in (`DSH_WEB_SEARCH_REAL_E2E=1`).
 - Preserve the web seam contracts: providers return fully-formed `WebSearchSource[]` and the
   consumer sets `truncated`; never mark results truncated yourself.
-- Preserve `redirect: "error"` on every engine fetch.
+- Preserve `redirect: "error"` on every plain-fetch engine leg; browser escalation navigates
+  like a real browser (redirects are followed there by design).
 - Preserve the oh-my-pi attribution and its MIT notice ([THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)) whenever engine or provider code is changed or extended.
 
 Changes to these constraints require updating this file and [docs/operations.md](docs/operations.md).

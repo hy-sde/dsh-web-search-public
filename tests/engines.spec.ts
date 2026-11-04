@@ -136,6 +136,24 @@ describe('parseEcosia', () => {
     expect(sources[0]).toEqual({ url: 'https://ecosia.test/one', title: 'Ecosia One', snippet: 'Ecosia snippet one.' })
     expect(sources[1]).toEqual({ url: 'https://ecosia.test/two', title: 'Ecosia Two', snippet: 'Ecosia snippet two.' })
   })
+
+  it('pairs snippets by page position when a result lacks one (no misattribution)', () => {
+    const sparse = [
+      '<div id="results">',
+      '  <article class="result">',
+      '    <a class="result__a" href="https://ecosia.test/first">Ecosia First</a>',
+      '  </article>',
+      '  <article class="result">',
+      '    <a class="result__a" href="https://ecosia.test/second">Ecosia Second</a>',
+      '    <p class="result__quote">Second snippet only.</p>',
+      '  </article>',
+      '</div>',
+    ].join('')
+    const sources = parseEcosia(sparse, 10)
+    expect(sources).toHaveLength(2)
+    expect(sources[0]).toEqual({ url: 'https://ecosia.test/first', title: 'Ecosia First' })
+    expect(sources[1]).toEqual({ url: 'https://ecosia.test/second', title: 'Ecosia Second', snippet: 'Second snippet only.' })
+  })
 })
 
 describe('unwrapGoogleHref', () => {
@@ -190,6 +208,24 @@ describe('parseGoogle', () => {
     const sources = parseGoogle(withAd, 10)
     expect(sources).toHaveLength(1)
     expect(sources[0]!.url).toBe('https://g.test/real')
+  })
+
+  it('pairs snippets by page position when a result lacks one (no misattribution)', () => {
+    const sparse = [
+      '<div id="search">',
+      '  <div class="g">',
+      '    <a href="https://g.test/first"><h3>First</h3></a>',
+      '  </div>',
+      '  <div class="g">',
+      '    <a href="https://g.test/second"><h3>Second</h3></a>',
+      '    <div class="VwiC3b">Second snippet only.</div>',
+      '  </div>',
+      '</div>',
+    ].join('')
+    const sources = parseGoogle(sparse, 10)
+    expect(sources).toHaveLength(2)
+    expect(sources[0]).toEqual({ url: 'https://g.test/first', title: 'First' })
+    expect(sources[1]).toEqual({ url: 'https://g.test/second', title: 'Second', snippet: 'Second snippet only.' })
   })
 })
 
