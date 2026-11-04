@@ -328,10 +328,13 @@ export class PublicSearchProvider implements WebSearchProvider {
   /** In-flight searches, tracked so {@link dispose} can drain them. */
   private readonly active = new Set<Promise<unknown>>()
   /**
-   * Engine-level aggregate promises (one per fan-out pass). An early deadline
-   * return abandons the aggregate while engines are still settling — dispose
-   * must drain these too, or unload leaves engine work (browser navigations,
-   * transport timers) running.
+   * Engine-level work promises: fan-out aggregates AND the raw engine
+   * operations themselves. An early deadline return abandons the aggregate
+   * while engines are still settling, and an aggregate settles when each
+   * attempt's timeout expires even though an aborted engine may still be
+   * running async cleanup — so the raw operations are tracked through FINAL
+   * settlement. Dispose drains both, or unload leaves engine work (browser
+   * navigations, transport timers) running.
    */
   private readonly inflight = new Set<Promise<unknown>>()
   private disposed = false
@@ -360,6 +363,19 @@ export class PublicSearchProvider implements WebSearchProvider {
     this.lifetime.abort()
     const pending = [...this.active, ...this.inflight]
     if (pending.length > 0) await Promise.allSettled(pending)
+  }
+
+  /**
+   * Track a raw engine operation through its FINAL settlement, independently
+   * of the attempt facade's timeout result: `Effect.timeout` settles the
+   * attempt while the underlying promise may still be tearing down.
+   */
+  private trackEngineOp(op: Promise<unknown>): void {
+    const tracked = op.finally(() => {
+      this.inflight.delete(tracked)
+    })
+    this.inflight.add(tracked)
+    void tracked.catch(() => { })
   }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
@@ -658,6 +674,9 @@ export class PublicSearchProvider implements WebSearchProvider {
     signal: AbortSignal | undefined,
   ): Promise<EngineAttempt> {
     const timeoutMs = this.options.timeoutMs
+    // `Effect.gen(function*() { … })` is a plain generator function — its own
+    // `this` is not the provider instance, so bind the tracker lexically.
+    const trackEngineOp = (op: Promise<unknown>): void => this.trackEngineOp(op)
     const program = Effect.gen(function*() {
       if (signal?.aborted) return { kind: 'canceled' as const, message: 'aborted by caller' }
       const controller = new AbortController()
@@ -683,10 +702,16 @@ export class PublicSearchProvider implements WebSearchProvider {
       // Cause.UnknownError, hiding the engine's message) — carry it through as
       // a tagged error and recover it into a structured attempt kind here.
       const outcome = yield* Effect.tryPromise({
-        try: () =>
-          engine.search(request, controller.signal).then(
+        try: () => {
+          // Track the RAW operation, not the timeout facade: the facade
+          // settles when `Effect.timeout` expires while the underlying
+          // promise may still be performing async cleanup.
+          const raw = engine.search(request, controller.signal)
+          trackEngineOp(raw)
+          return raw.then(
             sources => ({ kind: 'ok' as const, sources }),
-          ),
+          )
+        },
         catch: (error: unknown) => new EngineSearchError({ cause: error }),
       }).pipe(
         Effect.match({

@@ -589,6 +589,49 @@ describe('PublicSearchProvider', () => {
     await drained
     expect(settledSlow).toBe(true)
   })
+
+  it('drains engine cleanup that outlives the engine timeout when disposing', async () => {
+    let settledSlow = false
+    let releaseCleanup: (() => void) | undefined
+    const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve })
+    let resolveHold: () => void
+    const hold = new Promise<void>((resolve) => { resolveHold = resolve })
+    const slow: PublicEngine = {
+      id: 'startpage',
+      async search(_request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+        // Register before awaiting: an aborted signal never retroactively
+        // dispatches to listeners added afterwards.
+        signal?.addEventListener('abort', () => { setTimeout(resolveHold, 0) }, { once: true })
+        await hold
+        // The engine op now performs its (gated) cleanup. Its attempt() has
+        // already settled at the engine timeout — the drain must still track
+        // the raw operation through FINAL settlement.
+        await cleanupGate
+        settledSlow = true
+        return []
+      },
+    }
+    const fast = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/19', title: 'Quick' }] })
+    const subject = provider([slow, fast.engine], { timeoutMs: 20, softDeadlineMs: 10, hardDeadlineMs: 5_000 })
+
+    // The fast engine wins the soft-deadline race; the slow engine's attempt
+    // settles at its 20ms timeout while its cleanup stays gated.
+    const result = await subject.search({ query: 'q' })
+    expect(result.sources).toHaveLength(1)
+    await new Promise(resolve => setTimeout(resolve, 60))
+
+    // The engine timeout has long fired, yet disposal must still wait for the
+    // gated cleanup to finish — the raw op is tracked independently of the
+    // timeout outcome.
+    let disposeResolved = false
+    const drained = subject.dispose().then(() => { disposeResolved = true })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(disposeResolved).toBe(false)
+    releaseCleanup?.()
+    await vi.waitFor(() => { expect(disposeResolved).toBe(true) })
+    await drained
+    expect(settledSlow).toBe(true)
+  })
 })
 
 describe('plugin boot', () => {
