@@ -52,6 +52,12 @@ export class MojeekEngine implements PublicEngine {
         }
         : {}),
     })
+    // Block classification is independent of browser availability: without a
+    // scraper there is no escalation path, and a known block page must become
+    // a structured challenge failure — never a successful empty search.
+    if (isRobotPage(page)) {
+      throw new EngineSearchFailure('challenge', 'mojeek answered with a bot challenge page')
+    }
     const sources = parseMojeek(page.html, request.maxResults ?? 10)
     if (sources.length === 0 && looksLikeChallengePage(page.html)) {
       throw new EngineSearchFailure('challenge', 'mojeek answered with a bot challenge page')

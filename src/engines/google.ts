@@ -60,6 +60,13 @@ export class GoogleEngine implements PublicEngine {
         }
         : {}),
     })
+    // Block classification is independent of browser availability: without a
+    // scraper there is no escalation path, and a known block page must become
+    // a structured challenge failure — never a successful empty search.
+    const blocked = blockReason(page)
+    if (blocked !== undefined) {
+      throw new EngineSearchFailure('challenge', `google answered with a bot challenge page (${blocked})`)
+    }
     const sources = parseGoogle(page.html, request.maxResults ?? 10)
     if (sources.length === 0 && looksLikeChallengePage(page.html)) {
       throw new EngineSearchFailure('challenge', 'google answered with a bot challenge page')
@@ -94,7 +101,11 @@ export function parseGoogle(html: string, limit: number): WebSearchSource[] {
   // card's snippet cannot bleed into the previous result's window. Each entry
   // remembers its anchor's offset so snippets pair by POSITION IN THE PAGE.
   const candidates: { href: string | undefined; title: string | undefined; index: number }[] = []
-  for (const match of region.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^>"])*)>([\s\S]*?)<\/a>/g)) {
+  // The unrestricted-char alternative must exclude BOTH quote characters:
+  // letting it consume apostrophes gives every single-quoted attribute two
+  // consumption paths, which backtracks exponentially on an unclosed anchor
+  // (a synchronous block no search deadline can contain).
+  for (const match of region.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/g)) {
     const inner = match[2] ?? ''
     if (!/<h3[\s>]/i.test(inner)) continue
     const attrs = parseAttrs(match[1] ?? '')

@@ -6,9 +6,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { looksLikeChallengePage } from '../src/engines/challenge.ts'
 import { DuckDuckGoEngine, parseDuckDuckGo, unwrapDdgHref } from '../src/engines/duckduckgo.ts'
-import { parseEcosia, isBlockedPage } from '../src/engines/ecosia.ts'
-import { parseGoogle, unwrapGoogleHref, blockReason } from '../src/engines/google.ts'
-import { parseMojeek, isRobotPage } from '../src/engines/mojeek.ts'
+import { EcosiaEngine, parseEcosia, isBlockedPage } from '../src/engines/ecosia.ts'
+import { GoogleEngine, parseGoogle, unwrapGoogleHref, blockReason } from '../src/engines/google.ts'
+import { MojeekEngine, parseMojeek, isRobotPage } from '../src/engines/mojeek.ts'
 import { collectHiddenInputs, parseStartpage } from '../src/engines/startpage.ts'
 
 describe('unwrapDdgHref', () => {
@@ -235,6 +235,18 @@ describe('parseGoogle', () => {
     expect(sources[0]!.url).toBe('https://g.test/real')
   })
 
+  it('does not backtrack catastrophically on an unclosed anchor of single-quoted attributes', () => {
+    // The anchor attribute regex must stay quote-aware: with `[^>"]` the
+    // unrestricted alternative and the single-quoted alternative both consume
+    // `'`, and an unclosed anchor backtracks exponentially (and SYNCHRONOUSLY
+    // — no deadline can interrupt a hung regex on the event loop).
+    const hostile = '<div id="search"><a href=' + "'x' ".repeat(24) + '>unclosed'.repeat(8)
+    const startedAt = Date.now()
+    const sources = parseGoogle(hostile, 10)
+    expect(Date.now() - startedAt).toBeLessThan(250)
+    expect(sources).toEqual([])
+  })
+
   it('pairs snippets by page position when a result lacks one (no misattribution)', () => {
     const sparse = [
       '<div id="search">',
@@ -331,7 +343,8 @@ describe('bot-wall predicates', () => {
 describe('looksLikeChallengePage', () => {
   it('recognizes common bot-wall signatures', () => {
     expect(looksLikeChallengePage('<div id="px-captcha"></div>')).toBe(true)
-    expect(looksLikeChallengePage('Press &amp; Hold to continue')).toBe(true)
+    expect(looksLikeChallengePage('<div class="captcha-wrap"></div>')).toBe(true)
+    expect(looksLikeChallengePage('<altcha-widget></altcha-widget>')).toBe(true)
     expect(looksLikeChallengePage('Unfortunately, bots use DuckDuckGo too.')).toBe(true)
     expect(looksLikeChallengePage('<script src="/cdn-cgi/challenge-platform/h/g/orchestrate"></script>')).toBe(true)
     expect(looksLikeChallengePage('<div class="g-recaptcha"></div>')).toBe(true)
@@ -341,6 +354,18 @@ describe('looksLikeChallengePage', () => {
   it('does not flag ordinary pages', () => {
     expect(looksLikeChallengePage('<html><body>No results found</body></html>')).toBe(false)
     expect(looksLikeChallengePage('')).toBe(false)
+  })
+
+  it('does not flag a no-results page that merely echoes wall terms as the query', () => {
+    // Search pages echo the query inside the title and form controls. Bare
+    // terms like "perimeterx" must never classify a page — only structural
+    // wall markers do.
+    const query = 'site:example.invalid perimeterx'
+    const page = `<html><head><title>${query} - Startpage.com</title></head><body>`
+      + `<form method="post" action="/sp/search"><input type="text" name="query" value="${query}">`
+      + `<p>No results. Try different keywords.</p></body></html>`
+    expect(looksLikeChallengePage(page)).toBe(false)
+    expect(looksLikeChallengePage('perimeterx')).toBe(false)
   })
 })
 
@@ -352,6 +377,43 @@ describe('DuckDuckGoEngine', () => {
   it('rejects a 200 challenge form as a structured challenge instead of an accepted empty page', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('Unfortunately, bots use DuckDuckGo too.', { status: 200 })))
     const engine = new DuckDuckGoEngine('test-agent')
+    await expect(engine.search({ query: 'anything' }, undefined))
+      .rejects.toMatchObject({ kind: 'challenge' })
+  })
+})
+
+describe('browser-backed engines without a scraper', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  // createEngines() supports omitting the scraper. Escalation is then
+  // unavailable, but a KNOWN block page must still classify as a challenge —
+  // never degrade into a successful empty search.
+  it('google classifies its enablejs wall as a challenge without a scraper', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      '<html><head><meta http-equiv="refresh" content="0; url=/httpservice/retry/enablejs"></head>'
+        + '<body><p>JavaScript is disabled.</p></body></html>',
+      { status: 200 },
+    )))
+    const engine = new GoogleEngine('test-agent')
+    await expect(engine.search({ query: 'anything' }, undefined))
+      .rejects.toMatchObject({ kind: 'challenge' })
+  })
+
+  it('ecosia classifies its firewall page as a challenge without a scraper', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html><body>Ecosia Firewall</body></html>', { status: 200 })))
+    const engine = new EcosiaEngine('test-agent')
+    await expect(engine.search({ query: 'anything' }, undefined))
+      .rejects.toMatchObject({ kind: 'challenge' })
+  })
+
+  it('mojeek classifies its robot page as a challenge without a scraper', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      '<html><body>Sending automated queries to our service is not allowed.</body></html>',
+      { status: 200 },
+    )))
+    const engine = new MojeekEngine('test-agent')
     await expect(engine.search({ query: 'anything' }, undefined))
       .rejects.toMatchObject({ kind: 'challenge' })
   })

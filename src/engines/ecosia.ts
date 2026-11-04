@@ -55,6 +55,12 @@ export class EcosiaEngine implements PublicEngine {
         }
         : {}),
     })
+    // Block classification is independent of browser availability: without a
+    // scraper there is no escalation path, and a known block page must become
+    // a structured challenge failure — never a successful empty search.
+    if (isBlockedPage(page)) {
+      throw new EngineSearchFailure('challenge', 'ecosia answered with a bot challenge page')
+    }
     const sources = parseEcosia(page.html, request.maxResults ?? 10)
     if (sources.length === 0 && looksLikeChallengePage(page.html)) {
       throw new EngineSearchFailure('challenge', 'ecosia answered with a bot challenge page')
