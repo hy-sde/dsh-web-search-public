@@ -42,4 +42,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## @hy-sde-org/effect
+
+The provider's concurrency layer (fan-out with soft/hard deadlines, cross-engine
+consensus merge) uses [`@hy-sde-org/effect`](https://www.npmjs.com/package/@hy-sde-org/effect) —
+a trimmed source fork of [`effect`](https://github.com/Effect-TS/effect) `packages/effect`
+at tag `effect@4.0.5` (commit `7f524e25cfb49a71ac39b0f44278d08d40dda5de`). The fork carries
+only the combinator core (`Effect`, `Cause`, `Data`, `Deferred`, `Exit`, `Scheduler` and their
+closed dependency set); the kept fiber runtime is unmodified upstream source. effect is
+distributed under the MIT License (© the Effect-TS authors), included in the fork's LICENSE.
+
 All other code in this package is MIT (see LICENSE).

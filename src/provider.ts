@@ -19,7 +19,7 @@ import type {
   WebSearchResult,
   WebSearchSource,
 } from '@deepseek-ai/dsh-web'
-import { Cause, Data, Effect, Scheduler } from 'effect'
+import { Cause, Data, Effect, Scheduler } from '@hy-sde-org/effect'
 import type { PublicEngine, PublicEngineId } from './types.ts'
 
 /**
