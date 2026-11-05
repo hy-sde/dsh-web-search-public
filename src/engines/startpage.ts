@@ -7,7 +7,7 @@
 
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
-import { looksLikeChallengePage } from './challenge.ts'
+import { classifyChallengePage } from './challenge.ts'
 import { anchors, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
 import { fetchHtml } from './http.ts'
 
@@ -31,7 +31,7 @@ export class StartpageEngine implements PublicEngine {
       signal,
     })
     const sources = parseStartpage(html, request.maxResults ?? 10)
-    if (sources.length === 0 && looksLikeChallengePage(html)) {
+    if (sources.length === 0 && classifyChallengePage(html) !== undefined) {
       throw new EngineSearchFailure('challenge', 'startpage answered with a bot challenge page')
     }
     return sources

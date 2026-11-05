@@ -18,6 +18,8 @@ import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import * as publicPlugin from '../src/index.ts'
 import { PUBLIC_PROVIDER_ID, PublicSearchProvider } from '../src/provider.ts'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../src/types.ts'
+import { createEngines } from '../src/engines/index.ts'
+import { enginePages, queryEchoPage, SEARCH_SOURCE } from './search-pages.ts'
 
 const startpageHome = [
   '<form>',
@@ -99,6 +101,35 @@ function provider(engines: PublicEngine[], overrides: ProviderOverrides = {}): P
 
 afterEach(() => {
   vi.unstubAllGlobals()
+})
+
+describe.each(enginePages)('$id classification and provider health', ({ id, query, resultHtml, wallHtml }) => {
+  it('accepts an echoed no-results query without blocking the next search', async () => {
+    let html = queryEchoPage(query, '<p>No results found.</p>')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(html, { status: 200 })))
+    const subject = provider(createEngines([id], 'test-agent'))
+    try {
+      await expect(subject.search({ query })).resolves.toEqual({ sources: [], truncated: false })
+      html = queryEchoPage('ordinary follow-up query', resultHtml)
+      await expect(subject.search({ query: 'ordinary follow-up query' }))
+        .resolves.toEqual({ sources: [SEARCH_SOURCE], truncated: false })
+    } finally {
+      await subject.dispose()
+    }
+  })
+
+  it('still opens the cooldown for a genuine challenge', async () => {
+    let html = wallHtml
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(html, { status: 200 })))
+    const subject = provider(createEngines([id], 'test-agent'))
+    try {
+      await expect(subject.search({ query })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      html = queryEchoPage('ordinary follow-up query', resultHtml)
+      await expect(subject.search({ query: 'ordinary follow-up query' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+    } finally {
+      await subject.dispose()
+    }
+  })
 })
 
 describe('PublicSearchProvider', () => {

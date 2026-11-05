@@ -11,21 +11,20 @@
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
-import { looksLikeChallengePage } from './challenge.ts'
+import { classifyChallengePage } from './challenge.ts'
 import { cleanText, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
 
 const SEARCH_URL = 'https://www.mojeek.com/search'
 const MOJEEK_HOME_URL = 'https://www.mojeek.com/?arc=none&lang=en&lb=en&theme=dark'
 const CAPTCHA_SOLVE_TIMEOUT_MS = 45_000
 
-/** ALTCHA / robot-wall classification. Exported for tests. */
+/**
+ * Detect challenge markup only when no organic results are available.
+ * @param page Loaded search response.
+ * @returns Whether browser escalation or a challenge failure is required.
+ */
 export function isRobotPage(page: LoadedHtmlPage): boolean {
-  return (
-    (page.html.includes('altcha-widget') ||
-      page.html.includes('captcha-wrap') ||
-      /sending automated queries/i.test(page.html)) &&
-    !page.html.includes('results-standard')
-  )
+  return classifyChallengePage(page.html) !== undefined && parseMojeek(page.html, 1).length === 0
 }
 
 export class MojeekEngine implements PublicEngine {
@@ -58,11 +57,7 @@ export class MojeekEngine implements PublicEngine {
     if (isRobotPage(page)) {
       throw new EngineSearchFailure('challenge', 'mojeek answered with a bot challenge page')
     }
-    const sources = parseMojeek(page.html, request.maxResults ?? 10)
-    if (sources.length === 0 && looksLikeChallengePage(page.html)) {
-      throw new EngineSearchFailure('challenge', 'mojeek answered with a bot challenge page')
-    }
-    return sources
+    return parseMojeek(page.html, request.maxResults ?? 10)
   }
 }
 

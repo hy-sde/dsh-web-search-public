@@ -10,7 +10,7 @@ import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { PublicEngine, PublicEngineId } from '../types.ts'
 import { EngineSearchFailure } from '../types.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
-import { looksLikeChallengePage } from './challenge.ts'
+import { classifyChallengePage } from './challenge.ts'
 import { anchors, dedupeSources, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
 
 const SEARCH_URL = 'https://www.ecosia.org/search'
@@ -18,19 +18,13 @@ const ECOSIA_HOME_URL = 'https://www.ecosia.org/'
 const RESULT_RENDER_TIMEOUT_MS = 10_000
 
 /**
- * `true` when Ecosia's Cloudflare front answered with the managed challenge
- * instead of results: a 403 titled "Ecosia Firewall" carrying the `_cf_chl_opt`
- * bootstrap and the challenge-platform loader. Exported for tests.
+ * Detect blocking statuses and challenge markup without rejecting query echoes.
+ * @param page Loaded search response.
+ * @returns Whether browser escalation or a challenge failure is required.
  */
 export function isBlockedPage(page: LoadedHtmlPage): boolean {
-  return (
-    page.status === 403 ||
-    page.status === 429 ||
-    page.html.includes('Ecosia Firewall') ||
-    page.html.includes('_cf_chl_opt') ||
-    page.html.includes('/cdn-cgi/challenge-platform/') ||
-    /confirm you.{0,3}re not a robot/i.test(page.html)
-  )
+  return page.status === 403 || page.status === 429
+    || (classifyChallengePage(page.html) !== undefined && parseEcosia(page.html, 1).length === 0)
 }
 
 export class EcosiaEngine implements PublicEngine {
@@ -61,11 +55,7 @@ export class EcosiaEngine implements PublicEngine {
     if (isBlockedPage(page)) {
       throw new EngineSearchFailure('challenge', 'ecosia answered with a bot challenge page')
     }
-    const sources = parseEcosia(page.html, request.maxResults ?? 10)
-    if (sources.length === 0 && looksLikeChallengePage(page.html)) {
-      throw new EngineSearchFailure('challenge', 'ecosia answered with a bot challenge page')
-    }
-    return sources
+    return parseEcosia(page.html, request.maxResults ?? 10)
   }
 }
 

@@ -1,52 +1,68 @@
 /**
- * Conservative bot-challenge detection for wall pages that slip past the
- * engines' own block classifiers (Google blockReason, Ecosia isBlockedPage,
- * Mojeek isRobotPage) — e.g. Startpage's PerimeterX wall or DuckDuckGo's
- * anomaly form, which arrive as HTTP 200 and would otherwise parse to a
- * "successful empty search".
- *
- * Callers MUST only consult this on a page whose parse produced zero results.
- * The signatures below then decide between "legitimately empty" and "walled":
- * a genuine results page ABOUT captchas carries results, so it can never be
- * misclassified, and an empty page is only called a challenge when a
- * structural/branded wall marker is present.
- *
- * The signatures match STRUCTURAL evidence — challenge widget elements, their
- * `id`/`class` attributes, and challenge infrastructure assets — never bare
- * terms: search pages echo the query inside form controls and the title, so a
- * query containing e.g. "perimeterx" must not trip the matcher. Those echo
- * surfaces are stripped before matching as a second defense.
+ * Challenge detection from widgets, forms, scripts, and navigation targets.
+ * Query text, result text, and quoted HTML inside raw-text elements are not evidence.
  * @module @hy-sde-org/dsh-web-search-public/engines/challenge
  */
 
-const CHALLENGE_SIGNATURES: readonly RegExp[] = [
-  // Challenge widgets announce themselves in `id`/`class` attributes:
-  // PerimeterX (Startpage), Mojeek's captcha wrapper, reCAPTCHA, Cloudflare.
-  /<[^>]*\b(?:id|class)\s*=\s*["']?[^"'>]*\b(?:px-captcha|captcha-wrap|g-recaptcha|cf-chl|cf-turnstile)\b/i,
-  // Challenge infrastructure loaded as scripts (PerimeterX, Cloudflare).
-  /<script[^>]*\bsrc\s*=\s*["'][^"']*(?:perimeterx|\/cdn-cgi\/challenge-platform\/)/i,
-  // The ALTCHA proof-of-work custom element (Mojeek wall).
-  /<altcha[\s/>-]/i,
-  // Wall banners are long, specific sentences — a query echoing one verbatim
-  // in body text is implausible, and these walls carry no other marker.
-  /unfortunately, bots use duckduckgo/i, // DuckDuckGo anomaly page
-  /unusual traffic from your computer/i, // Google sorry page
-]
+import { parseAttrs, scanTags } from './html.ts'
 
-/**
- * Remove the surfaces where engines echo the query text: form controls (the
- * echo sits INSIDE the `<input ...>` tag, so tag-anchored patterns cannot
- * exclude it — the whole tag must go), `<textarea>` bodies, and `<title>`.
- */
-function stripQueryEchoSurfaces(html: string): string {
-  return html
-    .replace(/<input\b[^>]*>/gi, '')
-    .replace(/<textarea\b[^>]*>[\s\S]*?<\/textarea>/gi, '')
-    .replace(/<title\b[^>]*>[\s\S]*?<\/title>/gi, '')
+type ChallengeKind = 'javascript' | 'challenge'
+
+const WIDGET = /(?:^|\s)(?:px-captcha|captcha-wrap|altcha-widget|g-recaptcha|cf-turnstile|cf-chl(?:-[^\s]+)?|anomaly-modal__modal)(?:\s|$)/i
+const RAW_TEXT = /<(script|style|textarea|title|template)\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)(?:<\/\1\s*>|$)/gi
+const CLOUDFLARE_BOOTSTRAP = /^\s*(?:\(\s*function\s*\(\s*\)\s*\{\s*)?window\._cf_chl_opt\s*=/
+const GOOGLE_RETRY_PATH = '/httpservice/retry/enablejs'
+
+function isWidget(tag: string, attrs: Readonly<Record<string, string>>): boolean {
+  return tag === 'altcha-widget' || WIDGET.test(attrs.id ?? '') || WIDGET.test(attrs.class ?? '')
 }
 
-/** `true` when the (empty-parsed) page carries a known bot-wall marker. */
-export function looksLikeChallengePage(html: string): boolean {
-  const stripped = stripQueryEchoSurfaces(html)
-  return CHALLENGE_SIGNATURES.some((pattern) => pattern.test(stripped))
+function classifyElement(tag: string, attrs: Readonly<Record<string, string>>): ChallengeKind | undefined {
+  if (isWidget(tag, attrs)) return 'challenge'
+  let target: string | undefined
+  if (tag === 'script') target = attrs.src
+  else if (tag === 'form') target = attrs.action
+  else if (tag === 'a') target = attrs.href
+  else if (tag === 'meta' && attrs['http-equiv']?.toLowerCase() === 'refresh') {
+    target = attrs.content?.match(/;\s*url\s*=\s*["']?([^"']+?)["']?\s*$/i)?.[1]
+  }
+  if (target === undefined) return undefined
+  const url = URL.parse(target, 'https://search.invalid')
+  if (url === null) return undefined
+  if (tag === 'form' && url.pathname === '/anomaly.js') return 'challenge'
+  if (tag === 'script' && (
+    url.hostname === 'perimeterx.net' || url.hostname.endsWith('.perimeterx.net')
+    || url.pathname.startsWith('/cdn-cgi/challenge-platform/')
+  )) return 'challenge'
+  if (url.pathname === GOOGLE_RETRY_PATH) return 'javascript'
+  return undefined
+}
+
+/**
+ * Classify recognized challenge markup without interpreting echoed query text.
+ * @param html Search response HTML.
+ * @returns The challenge kind, or `undefined` when no structural evidence exists.
+ */
+export function classifyChallengePage(html: string): ChallengeKind | undefined {
+  let bootstrap = false
+  const markup = html.replace(/<!--[\s\S]*?-->/g, '').replace(
+    RAW_TEXT,
+    (_match: string, name: string, attributes: string, body: string) => {
+      if (name.toLowerCase() !== 'script') return ''
+      if (CLOUDFLARE_BOOTSTRAP.test(body)) {
+        const type = parseAttrs(attributes).type?.toLowerCase()
+        if (type === undefined || type === 'text/javascript' || type === 'application/javascript' || type === 'module') bootstrap = true
+      }
+      return `<script${attributes}></script>`
+    },
+  )
+  if (bootstrap) return 'challenge'
+  let result: ChallengeKind | undefined
+  for (const { tag, attrs } of scanTags(markup, (tag, attrs) =>
+    tag === 'script' || tag === 'form' || tag === 'meta' || tag === 'a' || isWidget(tag, attrs))) {
+    const kind = classifyElement(tag, attrs)
+    if (kind === 'challenge') return kind
+    if (kind !== undefined) result = kind
+  }
+  return result
 }

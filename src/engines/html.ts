@@ -65,7 +65,7 @@ export interface Tag {
   readonly end: number
 }
 
-const TAG_OPEN_RE = /<([a-zA-Z][a-zA-Z0-9]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g
+const TAG_OPEN_RE = /<([a-zA-Z][a-zA-Z0-9-]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g
 const ATTR_RE = /([a-zA-Z_:][a-zA-Z0-9_:.\-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+))/g
 
 export function parseAttrs(raw: string): Readonly<Record<string, string>> {
@@ -109,7 +109,7 @@ export function elementsByClass(html: string, token: string, tag?: string): Tag[
 
 const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'])
 
-const CLOSE_TAG_RE = /<\/?([a-zA-Z][a-zA-Z0-9]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g
+const CLOSE_TAG_RE = /<\/?([a-zA-Z][a-zA-Z0-9-]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g
 
 /**
  * Visible text inside the element opened by `open`, with balanced same-tag nesting.

@@ -4,12 +4,15 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { looksLikeChallengePage } from '../src/engines/challenge.ts'
-import { DuckDuckGoEngine, parseDuckDuckGo, unwrapDdgHref } from '../src/engines/duckduckgo.ts'
-import { EcosiaEngine, parseEcosia, isBlockedPage } from '../src/engines/ecosia.ts'
-import { GoogleEngine, parseGoogle, unwrapGoogleHref, blockReason } from '../src/engines/google.ts'
-import { MojeekEngine, parseMojeek, isRobotPage } from '../src/engines/mojeek.ts'
+import { classifyChallengePage } from '../src/engines/challenge.ts'
+import type { PageScraper } from '../src/engines/browser-page.ts'
+import { createEngines } from '../src/engines/index.ts'
+import { parseDuckDuckGo, unwrapDdgHref } from '../src/engines/duckduckgo.ts'
+import { parseEcosia, isBlockedPage } from '../src/engines/ecosia.ts'
+import { parseGoogle, unwrapGoogleHref, blockReason } from '../src/engines/google.ts'
+import { parseMojeek, isRobotPage } from '../src/engines/mojeek.ts'
 import { collectHiddenInputs, parseStartpage } from '../src/engines/startpage.ts'
+import { enginePages, queryEchoPage, SEARCH_SOURCE } from './search-pages.ts'
 
 describe('unwrapDdgHref', () => {
   it('unwraps a uddg redirect (entity-decoded href)', () => {
@@ -318,103 +321,113 @@ describe('parseMojeek', () => {
 })
 
 describe('bot-wall predicates', () => {
-  it('classifies Google enable-JS and traffic walls', () => {
+  it('classifies Google JavaScript navigation and blocking responses', () => {
     expect(blockReason({ html: '<script src="/httpservice/retry/enablejs"></script>', status: 200, url: 'https://www.google.com/search' }))
       .toBe('javascript')
-    expect(blockReason({ html: '<html></html>', status: 403, url: 'https://www.google.com/search' })).toBe('traffic')
-    expect(blockReason({ html: 'Unusual traffic', status: 200, url: 'https://www.google.com/search' })).toBe('traffic')
-    expect(blockReason({ html: '<div id="search"><a href="/url?q=x"><h3>ok</h3></a></div>', status: 200, url: 'u' }))
-      .toBeUndefined()
+    expect(blockReason({ html: '', status: 403, url: 'https://www.google.com/search' })).toBe('traffic')
+    expect(blockReason({ html: '', status: 200, url: 'https://www.google.com/sorry/index' })).toBe('traffic')
   })
 
-  it('classifies Ecosia Cloudflare firewall pages', () => {
-    expect(isBlockedPage({ html: '<title>Ecosia Firewall</title>', status: 200, url: 'u' })).toBe(true)
-    expect(isBlockedPage({ html: '<html>_cf_chl_opt</html>', status: 403, url: 'u' })).toBe(true)
-    expect(isBlockedPage({ html: '<article class="result__a"></article>', status: 200, url: 'u' })).toBe(false)
+  it('does not escalate Google results that also contain a noscript retry redirect', () => {
+    const html = '<noscript><meta http-equiv="refresh" content="0; url=/httpservice/retry/enablejs"></noscript>'
+      + '<div id="search"><a href="https://example.org/docs"><h3>Documentation</h3></a></div>'
+    expect(blockReason({ html, status: 200, url: 'https://www.google.com/search' })).toBeUndefined()
   })
 
-  it('classifies Mojeek ALTCHA walls only when results are absent', () => {
-    expect(isRobotPage({ html: '<div id="altcha-widget"></div>', status: 200, url: 'u' })).toBe(true)
-    expect(isRobotPage({ html: 'Sending automated queries', status: 403, url: 'u' })).toBe(true)
-    expect(isRobotPage({ html: '<ul class="results-standard"><li>x</li></ul>', status: 200, url: 'u' })).toBe(false)
-  })
-})
-
-describe('looksLikeChallengePage', () => {
-  it('recognizes common bot-wall signatures', () => {
-    expect(looksLikeChallengePage('<div id="px-captcha"></div>')).toBe(true)
-    expect(looksLikeChallengePage('<div class="captcha-wrap"></div>')).toBe(true)
-    expect(looksLikeChallengePage('<altcha-widget></altcha-widget>')).toBe(true)
-    expect(looksLikeChallengePage('Unfortunately, bots use DuckDuckGo too.')).toBe(true)
-    expect(looksLikeChallengePage('<script src="/cdn-cgi/challenge-platform/h/g/orchestrate"></script>')).toBe(true)
-    expect(looksLikeChallengePage('<div class="g-recaptcha"></div>')).toBe(true)
-    expect(looksLikeChallengePage('unusual traffic from your computer network')).toBe(true)
+  it('recognizes blocking HTTP statuses independently of result markup', () => {
+    expect(isBlockedPage({ html: '<article class="result__a"></article>', status: 429, url: 'https://www.ecosia.org/search' })).toBe(true)
   })
 
-  it('does not flag ordinary pages', () => {
-    expect(looksLikeChallengePage('<html><body>No results found</body></html>')).toBe(false)
-    expect(looksLikeChallengePage('')).toBe(false)
-  })
-
-  it('does not flag a no-results page that merely echoes wall terms as the query', () => {
-    // Search pages echo the query inside the title and form controls. Bare
-    // terms like "perimeterx" must never classify a page — only structural
-    // wall markers do.
-    const query = 'site:example.invalid perimeterx'
-    const page = `<html><head><title>${query} - Startpage.com</title></head><body>`
-      + `<form method="post" action="/sp/search"><input type="text" name="query" value="${query}">`
-      + `<p>No results. Try different keywords.</p></body></html>`
-    expect(looksLikeChallengePage(page)).toBe(false)
-    expect(looksLikeChallengePage('perimeterx')).toBe(false)
+  it('does not let an echoed results-standard term hide a Mojeek challenge', () => {
+    const html = queryEchoPage('results-standard', '<altcha-widget></altcha-widget>')
+    expect(isRobotPage({ html, status: 200, url: 'https://www.mojeek.com/search' })).toBe(true)
   })
 })
 
-describe('DuckDuckGoEngine', () => {
+describe('classifyChallengePage', () => {
+  it.each([
+    '<input value="class=\'g-recaptcha\'">',
+    '<div data-query="class=\'g-recaptcha\'">No results found.</div>',
+    '<textarea><div class="g-recaptcha"></div></textarea>',
+    '<title><div class="g-recaptcha"></div></title>',
+    '<script>const query = \'<div class="g-recaptcha"></div>\';</script>',
+    '<style>/* <div class="g-recaptcha"></div> */</style>',
+    '<template><div class="g-recaptcha"></div></template>',
+    '<!-- <div class="g-recaptcha"></div> -->',
+  ])('ignores inert markup and unrelated attribute values: %s', html => {
+    expect(classifyChallengePage(html)).toBeUndefined()
+  })
+
+  it('does not match challenge names embedded in ordinary identifiers or URL query parameters', () => {
+    const html = '<div class="not-g-recaptcha"></div><altcha-documentation></altcha-documentation>'
+      + '<script src="/assets/search.js?q=perimeterx"></script>'
+      + '<script src="/assets/search.js?q=/cdn-cgi/challenge-platform/"></script>'
+      + '<a href="/search?q=/httpservice/retry/enablejs">Documentation</a>'
+      + '<form action="/search?q=/anomaly.js"></form>'
+    expect(classifyChallengePage(html)).toBeUndefined()
+  })
+
+  it('recognizes active Cloudflare bootstrap code but not a quoted query in script data', () => {
+    expect(classifyChallengePage('<script>(function(){window._cf_chl_opt = {};})();</script>')).toBe('challenge')
+    expect(classifyChallengePage('<script type="application/json">{"query":"window._cf_chl_opt = {}"}</script>')).toBeUndefined()
+  })
+
+  it('recognizes challenge assets without requiring a rendered widget', () => {
+    expect(classifyChallengePage('<script src="//client.perimeterx.net/ABC/main.min.js"></script>')).toBe('challenge')
+  })
+
+  it('recognizes the DuckDuckGo anomaly form without relying on its banner wording', () => {
+    expect(classifyChallengePage('<form action="//duckduckgo.com/anomaly.js?sv=html" method="post"></form>')).toBe('challenge')
+  })
+})
+
+describe.each(enginePages)('$id query and challenge classification', ({ id, query, resultHtml, wallHtml }) => {
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  it('rejects a 200 challenge form as a structured challenge instead of an accepted empty page', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('Unfortunately, bots use DuckDuckGo too.', { status: 200 })))
-    const engine = new DuckDuckGoEngine('test-agent')
-    await expect(engine.search({ query: 'anything' }, undefined))
-      .rejects.toMatchObject({ kind: 'challenge' })
+  const browserModes = id === 'google' || id === 'ecosia' || id === 'mojeek' ? [false, true] : [false]
+  for (const { name, body, sources } of [
+    { name: 'empty results', body: '<p>No results found.</p>', sources: [] },
+    { name: 'organic results', body: resultHtml, sources: [SEARCH_SOURCE] },
+  ]) {
+    it.each(browserModes)(`accepts query echoes with ${name} (browser configured: %s)`, async browserConfigured => {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(queryEchoPage(query, body), { status: 200 })))
+      const scrape = vi.fn<PageScraper>(async () => { throw new Error('Unexpected browser escalation') })
+      const engine = createEngines([id], 'test-agent', browserConfigured ? scrape : undefined)[0]!
+      await expect(engine.search({ query })).resolves.toEqual(sources)
+      expect(scrape).not.toHaveBeenCalled()
+    })
+  }
+
+  it('rejects a genuine challenge without a browser scraper', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(wallHtml, { status: 200 })))
+    const engine = createEngines([id], 'test-agent')[0]!
+    await expect(engine.search({ query })).rejects.toMatchObject({ kind: 'challenge' })
   })
 })
 
-describe('browser-backed engines without a scraper', () => {
+describe('browser-backed challenge recovery', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  // createEngines() supports omitting the scraper. Escalation is then
-  // unavailable, but a KNOWN block page must still classify as a challenge —
-  // never degrade into a successful empty search.
-  it('google classifies its enablejs wall as a challenge without a scraper', async () => {
+  it.each(enginePages.filter(({ id }) => id === 'google' || id === 'ecosia' || id === 'mojeek'))(
+    '$id accepts query echoes in the page returned after escalation',
+    async ({ id, query, resultHtml, wallHtml }) => {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(wallHtml, { status: 200 })))
+      const scrape: PageScraper = async url => ({ url, status: 200, html: queryEchoPage(query, resultHtml) })
+      const engine = createEngines([id], 'test-agent', scrape)[0]!
+      await expect(engine.search({ query })).resolves.toEqual([SEARCH_SOURCE])
+    },
+  )
+
+  it('rejects a Google enable-JavaScript redirect without a scraper', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(
-      '<html><head><meta http-equiv="refresh" content="0; url=/httpservice/retry/enablejs"></head>'
-        + '<body><p>JavaScript is disabled.</p></body></html>',
+      '<meta http-equiv="refresh" content="0; url=/httpservice/retry/enablejs">',
       { status: 200 },
     )))
-    const engine = new GoogleEngine('test-agent')
-    await expect(engine.search({ query: 'anything' }, undefined))
-      .rejects.toMatchObject({ kind: 'challenge' })
-  })
-
-  it('ecosia classifies its firewall page as a challenge without a scraper', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html><body>Ecosia Firewall</body></html>', { status: 200 })))
-    const engine = new EcosiaEngine('test-agent')
-    await expect(engine.search({ query: 'anything' }, undefined))
-      .rejects.toMatchObject({ kind: 'challenge' })
-  })
-
-  it('mojeek classifies its robot page as a challenge without a scraper', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(
-      '<html><body>Sending automated queries to our service is not allowed.</body></html>',
-      { status: 200 },
-    )))
-    const engine = new MojeekEngine('test-agent')
-    await expect(engine.search({ query: 'anything' }, undefined))
-      .rejects.toMatchObject({ kind: 'challenge' })
+    const engine = createEngines(['google'], 'test-agent')[0]!
+    await expect(engine.search({ query: 'anything' })).rejects.toMatchObject({ kind: 'challenge' })
   })
 })

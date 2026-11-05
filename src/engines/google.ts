@@ -11,7 +11,7 @@
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { PublicEngine, PublicEngineId } from '../types.ts'
 import { EngineSearchFailure } from '../types.ts'
-import { looksLikeChallengePage } from './challenge.ts'
+import { classifyChallengePage } from './challenge.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { cleanText, dedupeSources, elementText, elementsByClass, isUsableUrl, parseAttrs, stripNoise } from './html.ts'
 
@@ -22,18 +22,16 @@ const RESULT_RENDER_TIMEOUT_MS = 10_000
 /** Consent cookie so the results page renders in a privacy-basic layout. */
 const CONSENT_COOKIE = 'CONSENT=YES+cb.20231217-14-p0.en+FX+116; SOCS=CAISHAgBEhJnd3NfMjAyNTAxMDgtMF9SQzIaAmVuIAEaBgiA_LipBg'
 
-/** Distinguish Google's bot walls from a real SERP. Exported for tests. */
+/**
+ * Detect blocking responses and challenge markup, not terms in query/result text.
+ * @param page Loaded search response.
+ * @returns The block reason, or `undefined` for an accepted page.
+ */
 export function blockReason(page: LoadedHtmlPage): 'javascript' | 'traffic' | undefined {
-  if (page.html.includes('/httpservice/retry/enablejs') && !/<h3\b/i.test(page.html)) return 'javascript'
-  if (
-    page.status === 403 ||
-    page.status === 429 ||
-    page.url.includes('/sorry/') ||
-    /unusual traffic|detected unusual traffic|g-recaptcha/i.test(page.html)
-  ) {
-    return 'traffic'
-  }
-  return undefined
+  if (page.status === 403 || page.status === 429 || page.url.includes('/sorry/')) return 'traffic'
+  const kind = classifyChallengePage(page.html)
+  if (kind === undefined || parseGoogle(page.html, 1).length > 0) return undefined
+  return kind === 'javascript' ? 'javascript' : 'traffic'
 }
 
 export class GoogleEngine implements PublicEngine {
@@ -67,11 +65,7 @@ export class GoogleEngine implements PublicEngine {
     if (blocked !== undefined) {
       throw new EngineSearchFailure('challenge', `google answered with a bot challenge page (${blocked})`)
     }
-    const sources = parseGoogle(page.html, request.maxResults ?? 10)
-    if (sources.length === 0 && looksLikeChallengePage(page.html)) {
-      throw new EngineSearchFailure('challenge', 'google answered with a bot challenge page')
-    }
-    return sources
+    return parseGoogle(page.html, request.maxResults ?? 10)
   }
 }
 

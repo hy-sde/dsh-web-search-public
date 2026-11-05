@@ -267,10 +267,7 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
   When a challenge triggers escalation, the real browser then navigates like a browser and
   follows redirects (it is a normal page navigation — no additional host restriction is
   imposed by this bundle).
-- **Challenges are expected.** Startpage, Ecosia, and Google frequently serve bot checks;
-  challenge pages are classified as structured `challenge` failures (they trip that engine's
-  breaker and are absorbed by the fan-out), never parsed as zero results. See
-  [docs/operations.md](docs/operations.md) for runtime expectations.
+- **Challenges are expected.** Recognized challenge pages produce structured `challenge` failures and trip the affected engine's breaker. On HTTP 200 pages, detection uses challenge widgets, forms, scripts, and navigation targets—not banner wording or query echoes in titles, controls, results, or empty-result headings. A page without recognizable challenge evidence can still appear as an empty result. See [docs/operations.md](docs/operations.md) for runtime expectations.
 
 ## Compatibility
 
