@@ -12,9 +12,11 @@ import {
   BrowserUnavailableError,
   browserFetch,
   BROWSER_PAGE_TIMEOUT_MS,
+  MAX_RENDERED_HTML_CHARS,
   type LoadedHtmlPage,
   type PageScraper,
 } from '../src/engines/browser-page.ts'
+import { MAX_HTML_BYTES } from '../src/engines/http.ts'
 import { buildBrowserNavigationHeaders } from '../src/engines/browser-headers.ts'
 
 const UA =
@@ -228,5 +230,29 @@ describe('browserFetch', () => {
       browser: { scrape: challengeScraper, shouldFallback: () => true },
     })
     ).rejects.toMatchObject({ kind: 'http', status: 403 })
+  })
+
+  it('rejects an oversized plain-fetch response before parsing', async () => {
+    const fetch = fetchMock()
+    fetch.mockResolvedValue(new Response('small', {
+      status: 200,
+      headers: { 'content-length': String(MAX_HTML_BYTES + 1) },
+    }))
+    await expect(browserFetch('https://www.google.com/search?q=x', { userAgent: UA }))
+      .rejects.toMatchObject({ kind: 'invalidResponse' })
+  })
+
+  it('rejects oversized rendered HTML returned by browser escalation', async () => {
+    const fetch = fetchMock()
+    fetch.mockResolvedValue(new Response('blocked', { status: 403 }))
+    const scrape = vi.fn(async () => ({
+      html: 'x'.repeat(MAX_RENDERED_HTML_CHARS + 1),
+      status: 200,
+      url: 'https://www.google.com/search?q=x',
+    }))
+    await expect(browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+      browser: { scrape, shouldFallback: () => false },
+    })).rejects.toMatchObject({ kind: 'invalidResponse' })
   })
 })

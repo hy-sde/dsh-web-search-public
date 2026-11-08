@@ -151,6 +151,7 @@ type EngineAttempt =
   | { readonly kind: 'challenge'; readonly message: string }
   | { readonly kind: 'http'; readonly message: string; readonly status?: number }
   | { readonly kind: 'transport'; readonly message: string }
+  | { readonly kind: 'invalidResponse'; readonly message: string }
   | { readonly kind: 'canceled'; readonly message?: string }
   | { readonly kind: 'failed'; readonly message: string }
 
@@ -217,7 +218,7 @@ export interface MergedSource {
 export function dedupKey(rawUrl: string): string {
   try {
     const url = new URL(rawUrl)
-    const host = url.hostname.toLowerCase().replace(/^www\./, '')
+    const host = url.host.toLowerCase().replace(/^www\./, '')
     let path = url.pathname
     if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1)
     return `${host}${path}${url.search}`
@@ -233,17 +234,18 @@ export function dedupKey(rawUrl: string): string {
  * rank — cross-engine consensus stays meaningful. Exported for tests.
  */
 export function mergeSources(merged: Map<string, MergedSource>, sources: readonly WebSearchSource[]): void {
-  const votes = new Map<string, WebSearchSource>()
-  for (const source of sources) {
+  const votes = new Map<string, { source: WebSearchSource; rank: number }>()
+  for (const [rank, source] of sources.entries()) {
     const key = dedupKey(source.url)
     // First occurrence wins: iteration follows rank order, so the first-seen
     // variant is the best-ranked one.
-    if (!votes.has(key)) votes.set(key, source)
+    if (!votes.has(key)) votes.set(key, { source, rank })
   }
-  for (const [rank, source] of [...votes.values()].entries()) {
-    const existing = merged.get(dedupKey(source.url))
+  for (const { source, rank } of votes.values()) {
+    const key = dedupKey(source.url)
+    const existing = merged.get(key)
     if (existing === undefined) {
-      merged.set(dedupKey(source.url), { source: { ...source }, engines: 1, bestRank: rank, order: merged.size })
+      merged.set(key, { source: { ...source }, engines: 1, bestRank: rank, order: merged.size })
       continue
     }
     existing.engines += 1
@@ -531,7 +533,7 @@ export class PublicSearchProvider implements WebSearchProvider {
             hardFailed.push(engine.id)
             this.recordTrip(engine.id, attempt.message, tripCounter)
           }
-        } else if (attempt.kind === 'transport') {
+        } else if (attempt.kind === 'transport' || attempt.kind === 'invalidResponse') {
           failures.push(`${engine.id}: ${attempt.message}`)
           softFailed.push(engine.id)
         } else if (attempt.kind === 'failed') {
@@ -574,7 +576,7 @@ export class PublicSearchProvider implements WebSearchProvider {
       // deliver. Everything settled with no success goes straight to the
       // aggregate below.
       if (!hasSuccess && settledCount < engines.length) {
-        const hard = cancellableSleep(Math.max(0, hardMs - softMs))
+        const hard = cancellableSleep(Math.max(0, deadlineAt - Date.now()))
         try {
           await Promise.race([trackedAll, firstSuccess, hard.promise])
         } finally {

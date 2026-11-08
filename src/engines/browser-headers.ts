@@ -4,8 +4,8 @@
  * The header set is derived from the caller's Chrome-shaped `User-Agent`, so
  * client hints (Sec-Ch-Ua*) and the UA string stay internally consistent (a
  * mismatched pair is itself a bot signal). This only makes the cheap fetch
- * path look like a real browser; the escalation to an actual stealth browser
- * lives in `browser-page.ts`.
+ * path look like a real browser; optional escalation through the host browser
+ * service lives in `browser-page.ts`.
  * @module @hy-sde-org/dsh-web-search-public/engines/browser-headers
  */
 

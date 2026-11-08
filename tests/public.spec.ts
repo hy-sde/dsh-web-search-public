@@ -12,7 +12,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
 import WebRuntime from '@deepseek-ai/dsh-web'
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import * as publicPlugin from '../src/index.ts'
@@ -172,6 +172,40 @@ describe('PublicSearchProvider', () => {
     })
   })
 
+  it('preserves original ranks when duplicate URL variants cast one vote', async () => {
+    const first = stubEngine('startpage', {
+      sources: [
+        { url: 'https://rank.test/a' },
+        { url: 'https://www.rank.test/a/' },
+        { url: 'https://rank.test/b' },
+      ],
+    })
+    const second = stubEngine('duckduckgo', {
+      sources: [
+        { url: 'https://rank.test/c' },
+        { url: 'https://rank.test/d' },
+      ],
+    })
+    const result = await provider([first.engine, second.engine]).search({ query: 'q' })
+    expect(result.sources.map(source => source.url)).toEqual([
+      'https://rank.test/a',
+      'https://rank.test/c',
+      'https://rank.test/d',
+      'https://rank.test/b',
+    ])
+  })
+
+  it('keeps distinct non-default ports as distinct sources', async () => {
+    const engine = stubEngine('startpage', {
+      sources: [
+        { url: 'https://ports.test:8443/docs' },
+        { url: 'https://ports.test:9443/docs' },
+      ],
+    })
+    const result = await provider([engine.engine]).search({ query: 'q' })
+    expect(result.sources).toHaveLength(2)
+  })
+
   it('returns the full merged list and leaves truncation to the web seam', async () => {
     const first = stubEngine('startpage', { sources: [{ url: 'https://s.test/1', title: 'S One' }] })
     const second = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/2', title: 'D Two' }] })
@@ -236,6 +270,28 @@ describe('PublicSearchProvider', () => {
     // empty page, not a failure — while the other engine never settled, so the
     // aggregate returns what it has rather than throwing.
     expect(result.sources).toEqual([])
+  })
+
+  it('does not grant an event-loop stall again after the absolute hard deadline', async () => {
+    const hanging: PublicEngine = {
+      id: 'startpage',
+      async search(_request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+        return await new Promise(resolve => {
+          signal?.addEventListener('abort', () => { resolve([]) }, { once: true })
+        })
+      },
+    }
+    const startedAt = performance.now()
+    const pending = provider([hanging], {
+      timeoutMs: 1_000,
+      softDeadlineMs: 20,
+      hardDeadlineMs: 100,
+    }).search({ query: 'q' })
+    // Delay dispatch of the soft timer until near the absolute deadline. The
+    // hard phase must use only the remaining budget, not hard minus soft again.
+    while (performance.now() - startedAt < 80) {}
+    await expect(pending).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+    expect(performance.now() - startedAt).toBeLessThan(130)
   })
 
   it('aggregates failures into a WEB_PROVIDER_ERROR when every engine fails', async () => {
@@ -718,6 +774,63 @@ describe('plugin boot', () => {
       snippet: 'First description here.',
     })
     await fiber.dispose()
+  })
+
+  it('preserves the browser service receiver during challenge escalation', async () => {
+    class BrowserProbe extends Service {
+      readonly mode = 'receiver-preserved'
+
+      constructor(ctx: Context) {
+        super(ctx, 'browser')
+      }
+
+      async fetchPageHtml(url: string): Promise<{ html: string; status: number; url: string }> {
+        return {
+          html: `<div id="search"><a href="https://browser.test/result"><h3>${this.mode}</h3></a></div>`,
+          status: 200,
+          url,
+        }
+      }
+    }
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('blocked', { status: 403 })))
+    const ctx = new Context()
+    await ctx.plugin(WebRuntime, { searchProvider: PUBLIC_PROVIDER_ID })
+    const browserFiber = await ctx.plugin(BrowserProbe)
+    const fiber = await ctx.plugin(publicPlugin, {
+      engines: ['google'],
+      softDeadlineMs: 50,
+      hardDeadlineMs: 500,
+      maxRetries: 0,
+    })
+    try {
+      await expect(ctx.web.search({ query: 'example' })).resolves.toMatchObject({
+        sources: [{ url: 'https://browser.test/result', title: 'receiver-preserved' }],
+      })
+    } finally {
+      await fiber.dispose()
+      await browserFiber.dispose()
+    }
+  })
+
+  it('lets the web seam report locally discarded results as truncated', async () => {
+    vi.stubGlobal('fetch', routerFixture())
+    const ctx = new Context()
+    await ctx.plugin(WebRuntime, { searchProvider: PUBLIC_PROVIDER_ID })
+    const fiber = await ctx.plugin(publicPlugin, {
+      engines: ['duckduckgo'],
+      softDeadlineMs: 50,
+      hardDeadlineMs: 500,
+      maxRetries: 0,
+    })
+    try {
+      await expect(ctx.web.search({ query: 'example', maxResults: 1 })).resolves.toMatchObject({
+        sources: [{ url: 'https://example.org/docs' }],
+        truncated: true,
+      })
+    } finally {
+      await fiber.dispose()
+    }
   })
 
   it('prefers the configured provider over the deepseek default', async () => {

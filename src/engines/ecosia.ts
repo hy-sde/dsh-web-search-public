@@ -1,8 +1,8 @@
 /**
  * Ecosia engine: credential-free Google-indexed results served as static HTML.
- * Browser-backed (omp port): escalates to the host's stealth browser when
- * Cloudflare answers the plain fetch with an "Ecosia Firewall" managed
- * challenge instead of results.
+ * Escalates through the optional host browser service when Cloudflare answers
+ * the plain fetch with an "Ecosia Firewall" managed challenge instead of
+ * results.
  * @module @hy-sde-org/dsh-web-search-public/engines/ecosia
  */
 
@@ -11,7 +11,7 @@ import type { PublicEngine, PublicEngineId } from '../types.ts'
 import { EngineSearchFailure } from '../types.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { classifyChallengePage } from './challenge.ts'
-import { anchors, dedupeSources, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
+import { acceptSearchPage, anchors, dedupeSources, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
 
 const SEARCH_URL = 'https://www.ecosia.org/search'
 const ECOSIA_HOME_URL = 'https://www.ecosia.org/'
@@ -55,7 +55,7 @@ export class EcosiaEngine implements PublicEngine {
     if (isBlockedPage(page)) {
       throw new EngineSearchFailure('challenge', 'ecosia answered with a bot challenge page')
     }
-    return parseEcosia(page.html, request.maxResults ?? 10)
+    return acceptSearchPage(this.id, page.html, parseEcosia(page.html, Number.POSITIVE_INFINITY))
   }
 }
 

@@ -11,7 +11,7 @@ import { EcosiaEngine } from '../src/engines/ecosia.ts'
 import { GoogleEngine } from '../src/engines/google.ts'
 import { MojeekEngine } from '../src/engines/mojeek.ts'
 import { StartpageEngine } from '../src/engines/startpage.ts'
-import { DEFAULT_USER_AGENT } from '../src/types.ts'
+import { DEFAULT_USER_AGENT, EngineSearchFailure } from '../src/types.ts'
 import type { PublicEngine } from '../src/types.ts'
 
 const ENABLED = process.env.DSH_WEB_SEARCH_REAL_E2E === '1'
@@ -38,7 +38,9 @@ describe.skipIf(!ENABLED)('live engines (DSH_WEB_SEARCH_REAL_E2E=1)', () => {
       try {
         const sources = await make().search({ query: 'deepseek', maxResults: 3 })
         if (sources.length === 0) outcome = 'empty'
-      } catch {
+      } catch (error) {
+        if (!(error instanceof EngineSearchFailure)
+          || (error.kind !== 'challenge' && error.kind !== 'http')) throw error
         outcome = 'challenged'
       }
       expect(['sources', 'empty', 'challenged']).toContain(outcome)

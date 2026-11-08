@@ -405,6 +405,15 @@ describe.each(enginePages)('$id query and challenge classification', ({ id, quer
     const engine = createEngines([id], 'test-agent')[0]!
     await expect(engine.search({ query })).rejects.toMatchObject({ kind: 'challenge' })
   })
+
+  it('rejects an unrecognized HTTP-200 page as retryable invalid data', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      '<html><head><title>Service unavailable</title></head><body>Maintenance in progress.</body></html>',
+      { status: 200 },
+    )))
+    const engine = createEngines([id], 'test-agent')[0]!
+    await expect(engine.search({ query })).rejects.toMatchObject({ kind: 'invalidResponse' })
+  })
 })
 
 describe('browser-backed challenge recovery', () => {

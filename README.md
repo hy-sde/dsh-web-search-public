@@ -37,13 +37,13 @@ never pin a search to the tool budget.
 ## Prerequisites
 
 - Node.js 22.19 or newer with npm and pnpm on `PATH`;
-- DeepSeek Harness `0.2.1-rc.5` including the standard `dsh` CLI;
-- no API keys — nothing else.
+- DeepSeek Harness `0.2.2-rc.1` including the standard `dsh` CLI;
+- no API keys.
 
 Install the Harness CLI and pnpm before continuing:
 
 ```bash
-npm install --global @deepseek-ai/dsh@0.2.1-rc.5 pnpm
+npm install --global @deepseek-ai/dsh@0.2.2-rc.1 pnpm
 dsh --version
 ```
 
@@ -76,9 +76,11 @@ path — always install the built tarball (or the published package).
 dsh web --dump-config
 ```
 
-The composed tree must show `web.config.searchProvider: public` and a `web-search-public-npm`
-plugin row loading `@hy-sde-org/dsh-web-search-public` (on harnesses that ship the bundled
-provider, the bundled `web-search-public` row shows as disabled).
+The composed tree must show a `web-search-public-npm` row loading
+`@hy-sde-org/dsh-web-search-public`; on harnesses that ship the bundled provider, the bundled
+`web-search-public` row is disabled. The bundle preserves the profile's existing
+`web.searchProvider` and `web.fetchProvider` selection. Without a pinned search provider,
+`ctx.web` auto-selects this provider when it is the sole usable search provider.
 
 ### Run
 
@@ -96,29 +98,29 @@ dsh plugin --profile web remove @hy-sde-org/dsh-web-search-public
 ```
 
 > **Already shipped?** If your harness checkout already mounts `web-search-public` in its base
-> bundle (a recent release adopted this provider as the shipped default), you can still install
-> this package — the patch disables the bundled row and mounts this package under a distinct
-> row id (`web-search-public-npm`), so the provider id `public` is registered exactly once.
+> bundle, the patch disables that row and mounts this package under a distinct row id
+> (`web-search-public-npm`), so the provider id `public` is registered exactly once.
 
 ## What the bundle does
 
 The package declares a DSH bundle (`dsh.bundle.patch` → `cordis.patch.yml`), so `dsh plugin`
 installs it and applies its patch layer to the profile:
 
-1. overrides the `web` row with `config: { searchProvider: public, fetchProvider: http }` —
-   the Loader replaces a row's config wholesale, so both keys are restated (the base bundle's
-   `fetchProvider: http` is preserved, not dropped),
-2. disables the bundled `web-search-public` row when the harness ships one (a no-op patch on
+1. disables the bundled `web-search-public` row when the harness ships one (a no-op patch on
    harnesses without it), and
-3. inserts this package as the `web-search-public-npm` plugin row.
+2. inserts this package as the `web-search-public-npm` plugin row.
 
-The keyed DeepSeek route (`web-search-deepseek`, provider id `deepseek-official`) is **not**
-disabled — deployments that prefer it keep their explicit choice by setting
-`web.searchProvider: deepseek-official` and providing the `DEEPSEEK_API_KEY` credential.
-This bundle mounts no fetch provider of its own and changes no `tool-web` settings; whether
-the model can fetch arbitrary URLs is decided by the `tool-web` row of your composition (the
-shipped harness base enables `tool-web` fetch). SSRF posture is governed by the fetch
-provider's own guards in that row, not by this bundle.
+The patch does not rewrite the `web` row. Existing `searchProvider` and `fetchProvider`
+choices remain intact; a profile that already selects provider id `public` automatically uses
+this replacement. Without a pinned search provider, the web service auto-selects this
+credential-free provider when it is the sole usable search provider. To select it explicitly,
+set `web.searchProvider: public` in a profile patch.
+
+The keyed DeepSeek route (`web-search-deepseek`, provider id `deepseek-official`) is not
+disabled. Deployments that prefer it keep `web.searchProvider: deepseek-official` and provide
+the `DEEPSEEK_API_KEY` credential. This bundle mounts no fetch provider and changes no
+`tool-web` settings; whether the model can fetch arbitrary URLs is decided by the profile's
+fetch provider and `tool-web` row.
 
 ## How the fan-out works
 
@@ -147,19 +149,14 @@ provider's own guards in that row, not by this bundle.
 - Each engine still runs under its own `AbortSignal.timeout(timeoutMs)` race, so an engine
   that ignores the aggregate’s cancellation dies at its own cap.
 - **Rate-limit resilience is best-effort, layered, and verdict-driven.** Engine outcomes are
-  classified — accepted page (with or without results), challenge wall, HTTP status, transport
-  failure, timeout, or canceled. A challenge wall, an HTTP 4xx, or an engine still pending at
-  the hard deadline opens *that engine’s* circuit breaker: it is skipped for `engineBackoffMs`
-  (5 min default, doubling per consecutive trip up to `maxEngineBackoffMs`), with no request
-  sent, and probed again after the window. Retryable transport failures (HTTP 5xx, timeout,
-  network fetch failure) retry the whole fan-out after an exponential backoff
-  (`maxRetries`/`retryDelayMs`, abort-aware sleep); hard blocks are never retried. Once retries
-  are exhausted — or every engine is down — the provider fast-fails for `failureCooldownMs`
-  (5 min default) with a `retry in about Ns` error instead of re-blasting engines that just
-  throttled us (which would deepen the block). An accepted zero-result page is a query-level
-  verdict: it is returned as `[]` and neither retried nor cooled down, and it never trips the
-  breaker (an obscure query must not disable an engine).
-
+  classified — accepted page with results, explicit no-results page, challenge wall, HTTP
+  status, invalid response, transport failure, timeout, or cancellation. A challenge wall,
+  an HTTP 4xx, or an engine still pending at the hard deadline opens *that engine’s* circuit
+  breaker. Retryable transport, HTTP 5xx, oversized, and unrecognized-page failures retry the
+  whole fan-out after an exponential backoff (`maxRetries`/`retryDelayMs`, abort-aware sleep);
+  hard blocks are never retried. Once retries are exhausted—or every engine is down—the
+  provider fast-fails for `failureCooldownMs`. A verified no-results page is a query-level
+  verdict: it returns `[]`, is not retried, and does not trip the breaker.
 - Unloading the plugin aborts in-flight searches and drains them before unload completes
   (a disposed provider answers new searches with `WEB_PROVIDER_UNAVAILABLE`).
 - A caller abort (`signal.aborted`) aborts the fan-out and throws `WEB_ABORTED`; an aborted
@@ -168,10 +165,6 @@ provider's own guards in that row, not by this bundle.
   with each engine’s reason (`id: <reason>; …`) — engines that were still running at the hard
   deadline are listed as `did not settle before the hard deadline`. If at least one engine
   accepted the search and found nothing, the call succeeds with `[]` (`truncated: false`).
-- A caller abort (`signal.aborted`) aborts the fan-out and throws `WEB_ABORTED`.
-- Only if **every** engine fails does the provider throw `WEB_PROVIDER_ERROR` with each
-  engine’s reason (`id: <reason>; …`). Zero organic results, a timed-out engine, and a failed
-  HTTP request all count as “this engine has nothing” and are absorbed by the merge.
 
 The worst case for the default configuration is ≈ `hardDeadlineMs` (30 s) overall — the
 deadline is the whole budget for the search including retries and their backoff — well under
@@ -179,16 +172,12 @@ the 60-second search budget `dsh-tool-web` books in the shipped harness bundle.
 
 ### Browser escalation (bot walls)
 
-Google, Ecosia and Mojeek are **browser-backed** (an omp `browserFetch` port): each engine
-first tries a plain `fetch` carrying coherent Chrome navigation headers (client hints
-derived from its UA), and when that is answered with a bot wall — an enable-JS retry page,
-a Cloudflare managed challenge ("Ecosia Firewall"), Mojeek's ALTCHA proof-of-work wall, or
-Google's "unusual traffic" `/sorry` gate — it escalates to a real browser via
-`ctx.browser.fetchPageHtml` (`@hy-sde-org/dsh-browser` service, stealth `launch` or
-CloakBrowser `patch` backend): home-URL cookie seeding, best-effort ready-selector wait, and
-ALTCHA auto-solve (force-click of the shadow-DOM checkbox + PoW redirect wait, omp's
-`solveCaptcha`). The circuit breaker only opens when every transport — fetch *and* browser —
-is blocked.
+Google, Ecosia and Mojeek are browser-backed: each engine first tries a plain `fetch` carrying
+coherent Chrome navigation headers. A recognized JavaScript, Cloudflare, ALTCHA, or unusual-
+traffic wall escalates through `ctx.browser.fetchPageHtml` when that optional service is
+mounted. Escalation may seed a home URL, wait for a results selector, or handle ALTCHA.
+Browser behavior and hardening are owned by the mounted browser provider. The circuit breaker
+opens only when every available transport is blocked.
 
 Escalation resolves the `browser` service lazily at the first challenged fetch, so mount order
 never matters — a browser row mounted later still lights the browser-backed engines up. When
@@ -205,7 +194,7 @@ All options are optional; constants fill the defaults. Configure via the plugin 
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `engines` | `startpage, duckduckgo, ecosia, google, mojeek` | engine ids the fan-out races; this order is the tiebreak for consensus ties; unlisted engines stay disabled; an explicit empty array is rejected at activation — omit the key for the default set |
-| `timeoutMs` | `30000` | per-engine transport timeout (ms): bounds one engine even if it ignores aggregate cancellation; browser-backed engines may spend it on fetch → stealth-browser escalation, so the default is 30 s |
+| `timeoutMs` | `30000` | per-engine transport timeout (ms): bounds one engine even if it ignores aggregate cancellation; browser-backed engines may spend it on fetch → browser escalation, so the default is 30 s |
 | `softDeadlineMs` | `5000` | soft aggregate deadline — return as soon as all engines settled or this passes with ≥1 success |
 | `hardDeadlineMs` | `30000` | hard aggregate deadline — the overall budget across retries and their backoff; past it the call returns whatever it has, even nothing; must be ≥ `softDeadlineMs` |
 | `maxRetries` | `1` | retries for the all-engines-failed aggregate when at least one engine died from a *retryable* transport failure (HTTP 5xx, a timeout, or a network fetch failure). Each retry re-runs the whole fan-out after a backoff, so a short engine throttle that strips the first attempt still yields results. `0` disables retrying. Hard blocks (HTTP 4xx) are never retried — they open that engine’s circuit breaker — and a pure all-`no results` aggregate is query-level and never retried. |
@@ -216,7 +205,7 @@ All options are optional; constants fill the defaults. Configure via the plugin 
 | `userAgent` | browser-shaped constant | User-Agent sent to the engines (deliberately not the product UA) |
 
 ```yaml
-- id: web-search-public
+- id: web-search-public-npm
   name: '@hy-sde-org/dsh-web-search-public'
   config:
     engines: [startpage, duckduckgo, google, mojeek]   # drop Ecosia, reorder
@@ -250,32 +239,30 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
 
 ## Privacy and security notes
 
-- **No credentials.** The provider never reads a key, so a leak cannot happen. Engines
-  receive the query, the browser-shaped User-Agent, and nothing else.
-- **Treat queries as public.** Each query is sent to public search engines as an anonymous
-  request — including, because of the fan-out, several engines at once. Do not search for
-  secrets or PII you would not paste into a public search box.
-- **Amplification is inherent.** Every search contacts every configured engine in parallel
-  (up to 5 anonymous scrapes per query). That is the price of resilience and consensus, and
-  it raises bot-challenge / rate-limit exposure compared with a single-engine chain — see
-  [docs/operations.md](docs/operations.md).
+- **No plugin credentials.** The provider does not read API keys or account tokens. Searches
+  still use a browser-shaped User-Agent, a fixed Google consent cookie, and any engine-issued
+  cookies retained by the mounted browser service's scraper context.
+- **Treat queries as public.** Each query is sent to several public search engines. Do not
+  search for secrets or PII you would not paste into a public search box.
+- **Amplification is inherent.** Every search contacts every configured engine concurrently.
+  Startpage alone uses a homepage GET plus a search POST; browser escalation may add home-page
+  navigation, redirects, and subresource requests. See [docs/operations.md](docs/operations.md).
+- **Responses are bounded.** Plain-fetch HTML is limited to 2 MiB before parsing; browser
+  escalation rejects rendered HTML above 2 Mi characters.
 - **No fetch provider of our own.** This bundle mounts no fetch provider and changes no
-  `tool-web` settings; whether the model can fetch arbitrary URLs is decided by your
-  `tool-web` row (the shipped harness base enables fetch), not by this bundle.
-- **Redirect policy is per-transport.** The plain-fetch legs of every engine use
-  `redirect: "error"` — a redirect is rejected before any `Location` target is contacted.
-  When a challenge triggers escalation, the real browser then navigates like a browser and
-  follows redirects (it is a normal page navigation — no additional host restriction is
-  imposed by this bundle).
-- **Challenges are expected.** Recognized challenge pages produce structured `challenge` failures and trip the affected engine's breaker. On HTTP 200 pages, detection uses challenge widgets, forms, scripts, and navigation targets—not banner wording or query echoes in titles, controls, results, or empty-result headings. A page without recognizable challenge evidence can still appear as an empty result. See [docs/operations.md](docs/operations.md) for runtime expectations.
+  `tool-web` settings.
+- **Redirect policy is per transport.** Plain-fetch legs use `redirect: "error"`. Browser
+  escalation navigates like a browser and may follow redirects.
+- **Challenges are expected.** Recognized challenge pages produce structured failures.
+  Unrecognized HTTP-200 pages are retryable failures rather than false no-results answers.
 
 ## Compatibility
 
 | Component | Supported contract |
 | --- | --- |
 | Node.js | 22.19 or newer |
-| DeepSeek Harness | `0.2.1-rc.5` (`@deepseek-ai/dsh-web ^0.2.1-rc.5`, `@deepseek-ai/cordis` peer range) |
-| Seam | `ctx.web` `WebSearchProvider` (no key, no fetch provider) |
+| DeepSeek Harness | `0.2.2-rc.1` (`@deepseek-ai/dsh-web ^0.2.2-rc.1`, `@deepseek-ai/cordis ~4.1.0`) |
+| Seam | `ctx.web` `WebSearchProvider` (no API key, no fetch provider) |
 
 The provider implements only the `WebSearchProvider` seam contract; the model-facing tool is
 `@deepseek-ai/dsh-tool-web`, which this package does not ship. DeepSeek Harness is a

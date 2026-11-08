@@ -1,10 +1,9 @@
 /**
  * Mojeek engine: independent index, credential-free and the most no-JS friendly
- * engine in the chain. Browser-backed (omp port): escalates to the host's
- * stealth browser when the plain fetch is answered with the ALTCHA
- * proof-of-work wall ("altcha-widget") or an "automated queries" refusal — the
- * browser solves the PoW itself, so the escalation waits for the results list
- * and retries once.
+ * engine in the chain. It escalates through the optional host browser service
+ * when the plain fetch is answered with the ALTCHA proof-of-work wall or an
+ * automated-query refusal. The escalation asks the browser service to handle
+ * ALTCHA, waits for the results list, and retries once.
  * @module @hy-sde-org/dsh-web-search-public/engines/mojeek
  */
 
@@ -12,7 +11,7 @@ import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { classifyChallengePage } from './challenge.ts'
-import { cleanText, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
+import { acceptSearchPage, cleanText, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
 
 const SEARCH_URL = 'https://www.mojeek.com/search'
 const MOJEEK_HOME_URL = 'https://www.mojeek.com/?arc=none&lang=en&lb=en&theme=dark'
@@ -57,7 +56,7 @@ export class MojeekEngine implements PublicEngine {
     if (isRobotPage(page)) {
       throw new EngineSearchFailure('challenge', 'mojeek answered with a bot challenge page')
     }
-    return parseMojeek(page.html, request.maxResults ?? 10)
+    return acceptSearchPage(this.id, page.html, parseMojeek(page.html, Number.POSITIVE_INFINITY))
   }
 }
 

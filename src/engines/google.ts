@@ -1,10 +1,10 @@
 /**
  * Google engine: credential-free scrape of the classic results page. Google is
  * the most bot-challenged engine in the chain, so this engine is expected to
- * frequently advance the chain rather than succeed. Browser-backed (omp port):
- * when the plain fetch is answered with an enable-JS/enable-JS retry page, a
- * 403/429, or an "unusual traffic" block, it escalates to the host's stealth
- * browser and parses the rendered SERP.
+ * frequently advance the chain rather than succeed. When the plain fetch is
+ * answered with an enable-JS retry page, a 403/429, or an "unusual traffic"
+ * block, it escalates through the optional host browser service and parses the
+ * rendered SERP.
  * @module @hy-sde-org/dsh-web-search-public/engines/google
  */
 
@@ -13,7 +13,7 @@ import type { PublicEngine, PublicEngineId } from '../types.ts'
 import { EngineSearchFailure } from '../types.ts'
 import { classifyChallengePage } from './challenge.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
-import { cleanText, dedupeSources, elementText, elementsByClass, isUsableUrl, parseAttrs, stripNoise } from './html.ts'
+import { acceptSearchPage, cleanText, dedupeSources, elementText, elementsByClass, isUsableUrl, parseAttrs, stripNoise } from './html.ts'
 
 const SEARCH_URL = 'https://www.google.com/search'
 const GOOGLE_HOME_URL = 'https://www.google.com/'
@@ -65,7 +65,7 @@ export class GoogleEngine implements PublicEngine {
     if (blocked !== undefined) {
       throw new EngineSearchFailure('challenge', `google answered with a bot challenge page (${blocked})`)
     }
-    return parseGoogle(page.html, request.maxResults ?? 10)
+    return acceptSearchPage(this.id, page.html, parseGoogle(page.html, Number.POSITIVE_INFINITY))
   }
 }
 

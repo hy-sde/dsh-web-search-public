@@ -4,6 +4,7 @@
  */
 
 import type { WebSearchSource } from '@deepseek-ai/dsh-web'
+import { EngineSearchFailure } from '../types.ts'
 
 /** Comments, scripts, styles, and template content carry no visible results and may contain parser-hostile text. */
 export function stripNoise(html: string): string {
@@ -56,6 +57,26 @@ export function cleanText(input: string): string {
     .replace(/\s+/g, ' ')
     .replace(/\s+([.,;:!?])/g, '$1')
     .trim()
+}
+
+const NO_RESULTS_RE = /\b(?:no (?:web )?results|nothing found|0 results|did not match any documents|couldn['’]t find (?:any )?results)\b/i
+
+/** Whether a parsed-zero page explicitly says the search found no results. */
+export function isNoResultsPage(html: string): boolean {
+  return NO_RESULTS_RE.test(cleanText(stripNoise(html)))
+}
+
+/**
+ * Accept parsed sources or an explicit no-results page; reject unknown HTML so
+ * redesigns, maintenance pages, and unfamiliar walls remain retryable errors.
+ */
+export function acceptSearchPage(
+  engine: string,
+  html: string,
+  sources: WebSearchSource[],
+): WebSearchSource[] {
+  if (sources.length > 0 || isNoResultsPage(html)) return sources
+  throw new EngineSearchFailure('invalidResponse', `${engine} returned unrecognized search HTML`)
 }
 
 export interface Tag {

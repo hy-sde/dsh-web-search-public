@@ -1,17 +1,7 @@
-# Make the credential-free public search fan-out the default web-search provider:
-# one query fans out to all engines concurrently (Startpage, DuckDuckGo, Ecosia,
-# Google, Mojeek) and the answers are merged by cross-engine consensus, bounded by
-# soft/hard deadlines. It needs no API key and no fetch provider. The keyed
-# DeepSeek route (web-search-deepseek) is left untouched, so deployments that
-# explicitly choose their own provider via `web.searchProvider` keep that choice.
-#
-# The Loader replaces a targeted row's fields wholesale — `config` is never
-# deep-merged — so both keys are restated: `searchProvider` selects the public
-# fan-out, `fetchProvider` keeps the base bundle's SSRF-guarded anonymous fetch.
-- id: web
-  config:
-    searchProvider: public
-    fetchProvider: http
+# Replace a bundled provider with this package under the same provider id.
+# Provider selection remains owned by the profile's existing `web` row; when
+# no id is pinned, the web service auto-selects the sole usable provider.
+
 
 # Harnesses that already mount the bundled web-search-public row (deepseek-harness
 # base bundle mounts @deepseek-ai/dsh-web-search-public) must not load this package

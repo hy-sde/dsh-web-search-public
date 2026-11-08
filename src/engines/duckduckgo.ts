@@ -6,7 +6,7 @@
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
 import { classifyChallengePage } from './challenge.ts'
-import { anchors, cleanText, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
+import { acceptSearchPage, anchors, cleanText, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
 import { fetchHtml } from './http.ts'
 
 const HTML_ENDPOINT = 'https://html.duckduckgo.com/html/'
@@ -25,11 +25,11 @@ export class DuckDuckGoEngine implements PublicEngine {
       userAgent: this.userAgent,
       signal,
     })
-    const sources = parseDuckDuckGo(html, request.maxResults ?? 10)
+    const sources = parseDuckDuckGo(html, Number.POSITIVE_INFINITY)
     if (sources.length === 0 && classifyChallengePage(html) !== undefined) {
       throw new EngineSearchFailure('challenge', 'duckduckgo answered with a bot challenge page')
     }
-    return sources
+    return acceptSearchPage(this.id, html, sources)
   }
 }
 

@@ -1,5 +1,5 @@
 /**
- * Browser-profiled fetch with stealth-browser escalation — a port of
+ * Browser-profiled fetch with host-browser escalation — a port of
  * oh-my-pi's `browser-page.ts` against the harness' own `ctx.browser` service.
  *
  * Path division of labor (same as omp): every engine first tries a plain
@@ -25,6 +25,20 @@
 
 import { EngineSearchFailure } from '../types.ts'
 import { buildBrowserNavigationHeaders } from './browser-headers.ts'
+import { readHtmlResponse } from './http.ts'
+
+/** Maximum rendered HTML characters accepted from browser escalation. */
+export const MAX_RENDERED_HTML_CHARS = 2 * 1024 * 1024
+
+function assertRenderedHtmlLimit(page: LoadedHtmlPage): LoadedHtmlPage {
+  if (page.html.length > MAX_RENDERED_HTML_CHARS) {
+    throw new EngineSearchFailure(
+      'invalidResponse',
+      `rendered page exceeded the ${MAX_RENDERED_HTML_CHARS}-character HTML limit`,
+    )
+  }
+  return page
+}
 
 /** HTML plus the response status and final URL after redirects or browser navigation. */
 export interface LoadedHtmlPage {
@@ -149,7 +163,7 @@ async function fetchHtmlPage(url: string, options: BrowserFetchOptions): Promise
     }
     throw error
   }
-  return { html: await response.text(), status: response.status, url: response.url || url }
+  return { html: await readHtmlResponse(response), status: response.status, url: response.url || url }
 }
 
 /**
@@ -176,13 +190,13 @@ async function browseHtmlPage(
     if (signal?.aborted) throw new EngineSearchFailure('canceled', 'aborted by caller')
     let loaded: LoadedHtmlPage
     try {
-      loaded = await fallback.scrape(url, {
+      loaded = assertRenderedHtmlLimit(await fallback.scrape(url, {
         ...(fallback.homeUrl !== undefined ? { homeUrl: fallback.homeUrl } : {}),
         ...(fallback.ready !== undefined ? { ready: fallback.ready } : {}),
         ...(fallback.altcha !== undefined ? { altcha: fallback.altcha } : {}),
         timeoutMs: pageTimeoutMs,
         ...(signal !== undefined ? { signal } : {}),
-      })
+      }))
     } catch (error) {
       if (error instanceof BrowserUnavailableError) onUnavailable()
       throw error

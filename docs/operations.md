@@ -23,11 +23,11 @@ cost of thinner consensus.
 
 | Engine | Typical live behavior | Failure mode |
 | --- | --- | --- |
-| Startpage | organic results via the `div.result` / `a.result-title` / `p.description` markup; two requests (home for hidden fields, then POST) | bot challenge → structured `challenge` failure (trips the breaker, absorbed by the fan-out) |
-| DuckDuckGo | organic results via `div.result__body`; `uddg` redirect unwrap; `publishedAt` from result timestamps; paid `y.js` ad rows skipped | rate limit → zero results (query-level verdict; does not trip the breaker) |
-| Ecosia | `a.result__a` + `p.result__quote`; frequently 403 for headless clients | HTTP 403 → challenge-classified failure that trips the breaker (browser-backed: escalates to a real browser when mounted) |
-| Google | consent-cookie scrape of `div#search` `<h3>`-anchors; frequently challenged | consent/JS wall → challenge failure; escalation via the browser service when mounted |
-| Mojeek | `ul.results-standard` / `li` / `h2`-anchors + `p.s`; least hostile of the group | rare; ALTCHA wall → challenge failure |
+| Startpage | organic results via `div.result`; homepage GET plus search POST | bot challenge → structured `challenge` failure |
+| DuckDuckGo | organic results via `div.result__body`; wrapper URLs unwrapped; ads skipped | recognized challenge or unrecognized page → structured failure |
+| Ecosia | `a.result__a` + `p.result__quote`; frequently 403 for headless clients | HTTP 403 or challenge → breaker trip; optional browser escalation |
+| Google | consent-cookie scrape of `div#search` `<h3>` anchors | consent/JS wall → challenge; optional browser escalation |
+| Mojeek | `ul.results-standard` / `li` / `h2` anchors + `p.s` | ALTCHA wall → challenge; optional browser escalation |
 
 The engine list and markup are validated by the opt-in real test
 (`DSH_WEB_SEARCH_REAL_E2E=1 npm run test:real`). Engine markup changes (or bot-challenge
@@ -41,39 +41,34 @@ change and record what you observed.
   rather than a crawler identity.
 - Accept: `text/html, application/xhtml+xml, text/plain;q=0.9, */*;q=0.5`, plus an
   accept-language header.
-- Redirects: the plain-fetch legs of every engine use `redirect: "error"` — a redirect is
-  rejected before any `Location` target is contacted. When a challenge triggers browser
-  escalation, the real browser navigates like a browser and follows redirects (a normal
-  page load; this bundle adds no host restriction of its own).
-- Fan-out: **all configured engines are contacted per query** (up to 5 concurrent anonymous
-  requests, plus Startpage’s two-request handshake). There is no shared session, cookie jar,
-  or IP pooling beyond what the platform itself provides. Expect higher bot-challenge /
-  rate-limit pressure on the engine hosts than a single-engine chain would produce.
+- Body limits: plain-fetch responses are capped at 2 MiB while streaming; rendered browser
+  HTML is rejected above 2 Mi characters.
+- Redirects: plain-fetch legs use `redirect: "error"`. Browser escalation follows redirects
+  and may load subresources like a normal page.
+- Fan-out: all configured engines are contacted per query. Startpage makes two top-level
+  requests; browser escalation may add a home-page navigation, target navigation, redirects,
+  subresources, and a bounded Mojeek retry.
+- There is no IP pooling. Browser-engine cookies and storage may persist in the scraper
+  context owned by the mounted browser service.
 
 ## When results look wrong
 
-1. **No engine produced an accepted page** → the tool returns `WEB_PROVIDER_ERROR` with a
-   `id: reason; …` message. Reasons are the classified engine outcomes: a challenge wall
-   (`bot challenge (HTTP <status>)…`, possibly `…and no browser service mounted to escalate`),
-   `HTTP <status>`, `timed out`, a transport error, or `did not settle before the hard
-   deadline` for engines still running when the overall deadline passed.
-2. **One engine is flaky** → the fan-out absorbs it: its failed/challenged answers simply do
-   not contribute to the consensus merge, and its breaker opens so it is skipped for a while.
-   Check that engine’s markup against its parser with the real test.
-3. **Want a different engine set or order** → set `engines` in the plugin config (see
-   README). Engines not listed are never queried.
-4. **Want tighter latency / less amplification** → lower `softDeadlineMs`, shorten the
-   `engines` list, or both; the consensus becomes thinner and the merge cheaper.
-5. **Want the DeepSeek route** → keep this bundle installed for the fallback and set
-   `web.searchProvider: deepseek-official` plus the `DEEPSEEK_API_KEY` credential.
+1. **No engine produced an accepted page** → the tool returns `WEB_PROVIDER_ERROR` with
+   per-engine reasons: challenge, HTTP status, invalid or oversized response, timeout,
+   transport error, or hard-deadline expiry.
+2. **One engine is flaky** → the fan-out absorbs it and opens its breaker when applicable.
+3. **A search legitimately has no matches** → only a page with an explicit no-results marker
+   is accepted as `[]`; unknown HTTP-200 HTML remains a retryable engine failure.
+4. **Want a different engine set or order** → configure `engines`.
+5. **Want tighter latency or less amplification** → lower `softDeadlineMs`, shorten
+   `engines`, or both.
+6. **Want the DeepSeek route** → set `web.searchProvider: deepseek-official` and provide
+   `DEEPSEEK_API_KEY`.
 
 ## Privacy hygiene
 
-- Queries go to public engines verbatim and, because of the fan-out, to several of them at
-  once — never search with secrets or PII.
-- No key material and no tokens are ever sent. The only cookie is Google's **fixed**
-  `CONSENT` cookie (a compiled-in constant that suppresses Google's consent interstitial —
-  it carries no session state and is identical for every request); everything else is the
-  query, the fixed headers, and your source IP.
-- If your deployment must not disclose a query to third parties, do not use this provider —
-  use a keyed provider (e.g. `deepseek-official`) whose retrieval stays inside its own API.
+- Queries go to all configured public engines verbatim. Never search with secrets or PII.
+- The plugin reads no API key or account token. Requests include the browser-shaped user
+  agent, Google's fixed consent cookie on Google requests, and engine-issued state retained
+  by the mounted browser service's scraper context.
+- If a deployment must not disclose a query to third parties, do not use this provider.

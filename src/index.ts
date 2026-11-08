@@ -61,7 +61,7 @@ export const inject = ['web']
 
 /** Plugin config (all optional — `apply` fills constant defaults). */
 export interface Config {
-  /** Per-engine transport timeout (ms). Default: 10000. Each engine also dies here even if it ignores aggregate cancellation. */
+  /** Per-engine transport timeout (ms). Default: 30000. Each engine also dies here even if it ignores aggregate cancellation. */
   timeoutMs?: number
   /** Engine ids the fan-out races in this order (the tiebreak for consensus ties);
    * unlisted engines stay disabled. Default: startpage, duckduckgo, ecosia, google, mojeek.
@@ -152,9 +152,8 @@ function resolveBrowserScraper(ctx: Context): PageScraper {
       throw new BrowserUnavailableError()
     }
     const service = browser as { fetchPageHtml?: PageScraper } | null | undefined
-    const fetchPageHtml = service?.fetchPageHtml
-    if (typeof fetchPageHtml !== 'function') throw new BrowserUnavailableError()
-    return fetchPageHtml(url, options)
+    if (typeof service?.fetchPageHtml !== 'function') throw new BrowserUnavailableError()
+    return service.fetchPageHtml(url, options)
   }
 }
 

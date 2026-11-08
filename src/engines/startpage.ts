@@ -8,7 +8,7 @@
 import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
 import { classifyChallengePage } from './challenge.ts'
-import { anchors, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
+import { acceptSearchPage, anchors, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
 import { fetchHtml } from './http.ts'
 
 const HOME_URL = 'https://www.startpage.com/'
@@ -30,11 +30,11 @@ export class StartpageEngine implements PublicEngine {
       userAgent: this.userAgent,
       signal,
     })
-    const sources = parseStartpage(html, request.maxResults ?? 10)
+    const sources = parseStartpage(html, Number.POSITIVE_INFINITY)
     if (sources.length === 0 && classifyChallengePage(html) !== undefined) {
       throw new EngineSearchFailure('challenge', 'startpage answered with a bot challenge page')
     }
-    return sources
+    return acceptSearchPage(this.id, html, sources)
   }
 }
 
