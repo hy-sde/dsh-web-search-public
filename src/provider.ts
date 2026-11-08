@@ -32,6 +32,12 @@ import type {
 import { Cause, Data, Effect, Scheduler } from '@hy-sde-org/effect'
 import { EngineSearchFailure } from './types.ts'
 import type { PublicEngine, PublicEngineId } from './types.ts'
+import {
+  applyQueryConstraints,
+  normalizePublicSearchRequest,
+  type NormalizedPublicSearchRequest,
+  type StructuredQuery,
+} from './query.ts'
 
 /**
  * Error channel for one engine's failed search. Tagged so the effect error
@@ -268,16 +274,21 @@ export function mergeSources(merged: Map<string, MergedSource>, sources: readonl
 }
 
 /**
- * Resolve a `WebSearchResult` from merged consensus sources. The provider
- * returns the FULL merged list on purpose: the web seam caps it to the
- * request's `maxResults` and sets the `truncated` flag there, so callers see
- * an accurate flag instead of a silently-capped list that claims completeness.
+ * Resolve the full consensus list, then enforce observable query constraints.
+ * The web seam remains the sole owner of `maxResults` truncation.
  */
-function toResult(merged: Map<string, MergedSource>): WebSearchResult {
-  const sources = [...merged.values()]
+function toResult(merged: Map<string, MergedSource>, query: StructuredQuery): WebSearchResult {
+  const ranked = [...merged.values()]
     .sort((a, b) => b.engines - a.engines || a.bestRank - b.bestRank || a.order - b.order)
     .map(entry => entry.source)
-  return { sources, truncated: false }
+  const filtered = applyQueryConstraints(ranked, query)
+  return {
+    sources: filtered.sources,
+    truncated: false,
+    ...filtered.dropped.length > 0
+      ? { notices: filtered.dropped.map(label => `no results matched \`${label}\`; the constraint was relaxed`) }
+      : {},
+  }
 }
 
 /**
@@ -401,10 +412,11 @@ export class PublicSearchProvider implements WebSearchProvider {
         )
       }
     }
-    // Compose the caller's signal with the provider lifetime so a dispose()
-    // cancels in-flight engines exactly like a caller abort does.
+    // Parse once for the whole search, including retries. Every engine receives
+    // the same canonical operator view and structured recency value.
+    const normalized = normalizePublicSearchRequest(request)
     const searchSignal = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal
-    const run = this.searchAll(request, searchSignal)
+    const run = this.searchAll(normalized, searchSignal)
     const tracked = run.finally(() => {
       this.active.delete(tracked)
     })
@@ -420,7 +432,7 @@ export class PublicSearchProvider implements WebSearchProvider {
    * and the backoff sleep is bounded by it — a slow first attempt leaves the
    * retry only what is left, and an exhausted budget skips the retry entirely.
    */
-  private async searchAll(request: WebSearchRequest, signal: AbortSignal): Promise<WebSearchResult> {
+  private async searchAll(request: NormalizedPublicSearchRequest, signal: AbortSignal): Promise<WebSearchResult> {
     const hardMs = this.options.hardDeadlineMs ?? HARD_DEADLINE_MS
     const deadlineAt = Date.now() + hardMs
     // Last substantive all-failed record (one with real engine evidence).
@@ -468,7 +480,7 @@ export class PublicSearchProvider implements WebSearchProvider {
    * failures ("did not settle"). When at least one engine accepted the search
    * (results or an accepted empty page) the pass succeeds.
    */
-  private async fanOut(request: WebSearchRequest, signal: AbortSignal, deadlineAt: number): Promise<WebSearchResult> {
+  private async fanOut(request: NormalizedPublicSearchRequest, signal: AbortSignal, deadlineAt: number): Promise<WebSearchResult> {
     const engines = this.options.engines
     const softConfigured = this.options.softDeadlineMs ?? SOFT_DEADLINE_MS
     const hardConfigured = this.options.hardDeadlineMs ?? HARD_DEADLINE_MS
@@ -605,7 +617,7 @@ export class PublicSearchProvider implements WebSearchProvider {
       })
       throw new AllFailedError(failures, skipped, hardFailed, softFailed, tripCounter.count)
     }
-    return toResult(merged)
+    return toResult(merged, request.parsedQuery)
   }
 
   /** Whether an engine's circuit breaker is open right now. */
@@ -672,7 +684,7 @@ export class PublicSearchProvider implements WebSearchProvider {
    */
   private attempt(
     engine: PublicEngine,
-    request: WebSearchRequest,
+    request: NormalizedPublicSearchRequest,
     signal: AbortSignal | undefined,
   ): Promise<EngineAttempt> {
     const timeoutMs = this.options.timeoutMs

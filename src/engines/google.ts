@@ -8,9 +8,10 @@
  * @module @hy-sde-org/dsh-web-search-public/engines/google
  */
 
-import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
+import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { PublicEngine, PublicEngineId } from '../types.ts'
 import { EngineSearchFailure } from '../types.ts'
+import { formatScraperQuery, type PublicSearchRequest } from '../query.ts'
 import { classifyChallengePage } from './challenge.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { acceptSearchPage, cleanText, dedupeSources, elementText, elementsByClass, isUsableUrl, parseAttrs, stripNoise } from './html.ts'
@@ -18,6 +19,8 @@ import { acceptSearchPage, cleanText, dedupeSources, elementText, elementsByClas
 const SEARCH_URL = 'https://www.google.com/search'
 const GOOGLE_HOME_URL = 'https://www.google.com/'
 const RESULT_RENDER_TIMEOUT_MS = 10_000
+const RECENCY_TO_TBS = { day: 'qdr:d', week: 'qdr:w', month: 'qdr:m', year: 'qdr:y' } as const
+
 
 /** Consent cookie so the results page renders in a privacy-basic layout. */
 const CONSENT_COOKIE = 'CONSENT=YES+cb.20231217-14-p0.en+FX+116; SOCS=CAISHAgBEhJnd3NfMjAyNTAxMDgtMF9SQzIaAmVuIAEaBgiA_LipBg'
@@ -39,9 +42,14 @@ export class GoogleEngine implements PublicEngine {
 
   constructor(private readonly userAgent: string, private readonly scraper?: PageScraper) { }
 
-  async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
-    const count = Math.min(Math.max(request.maxResults ?? 10, 1), 20)
-    const params = new URLSearchParams({ q: request.query, hl: 'en', num: String(count) })
+  async search(request: PublicSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+    const count = Math.min(Math.max((request.maxResults ?? 9) + 1, 1), 20)
+    const params = new URLSearchParams({
+      q: formatScraperQuery(request.query, request.parsedQuery),
+      hl: 'en',
+      num: String(count),
+    })
+    if (request.recency !== undefined) params.set('tbs', RECENCY_TO_TBS[request.recency])
     const page = await browserFetch(`${SEARCH_URL}?${params}`, {
       userAgent: this.userAgent,
       ...(signal !== undefined ? { signal } : {}),

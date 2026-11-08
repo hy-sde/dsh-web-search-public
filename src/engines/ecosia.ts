@@ -6,9 +6,10 @@
  * @module @hy-sde-org/dsh-web-search-public/engines/ecosia
  */
 
-import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
+import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { PublicEngine, PublicEngineId } from '../types.ts'
 import { EngineSearchFailure } from '../types.ts'
+import { formatScraperQuery, type PublicSearchRequest } from '../query.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { classifyChallengePage } from './challenge.ts'
 import { acceptSearchPage, anchors, dedupeSources, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
@@ -32,8 +33,8 @@ export class EcosiaEngine implements PublicEngine {
 
   constructor(private readonly userAgent: string, private readonly scraper?: PageScraper) { }
 
-  async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
-    const url = `${SEARCH_URL}?${new URLSearchParams({ q: request.query, method: 'index' })}`
+  async search(request: PublicSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+    const url = `${SEARCH_URL}?${new URLSearchParams({ q: formatScraperQuery(request.query, request.parsedQuery), method: 'index' })}`
     const page = await browserFetch(url, {
       userAgent: this.userAgent,
       ...(signal !== undefined ? { signal } : {}),

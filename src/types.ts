@@ -4,7 +4,8 @@
  * @module @hy-sde-org/dsh-web-search-public/types
  */
 
-import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
+import type { WebSearchSource } from '@deepseek-ai/dsh-web'
+import type { PublicSearchRequest } from './query.ts'
 
 /** The anonymous engines the provider fans out to. */
 export const PUBLIC_ENGINE_IDS = [
@@ -40,7 +41,7 @@ export interface PublicEngine {
    * cancellation); plain `Error`s from third-party engines fall back to the
    * provider's legacy message signatures.
    */
-  search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]>
+  search(request: PublicSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]>
 }
 
 /**

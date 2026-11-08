@@ -172,6 +172,43 @@ describe('PublicSearchProvider', () => {
     })
   })
 
+  it('applies observable query constraints after the consensus merge', async () => {
+    const startpage = stubEngine('startpage', {
+      sources: [
+        { url: 'https://example.com/api.pdf', title: 'API Guide', publishedAt: '2026-02-01' },
+        { url: 'https://other.test/api.pdf', title: 'API Guide', publishedAt: '2026-02-01' },
+      ],
+    })
+    const ddg = stubEngine('duckduckgo', {
+      sources: [
+        { url: 'https://example.com/api.pdf', title: 'API Guide', publishedAt: '2026-02-01' },
+      ],
+    })
+
+    const result = await provider([startpage.engine, ddg.engine]).search({
+      query: 'site:example.com intitle:API filetype:pdf after:2026-01-01',
+    })
+
+    expect(result).toEqual({
+      sources: [{ url: 'https://example.com/api.pdf', title: 'API Guide', publishedAt: '2026-02-01' }],
+      truncated: false,
+    })
+  })
+
+  it('reports a constraint relaxed to preserve otherwise valid search results', async () => {
+    const engine = stubEngine('startpage', {
+      sources: [{ url: 'https://available.test/guide', title: 'Guide' }],
+    })
+
+    const result = await provider([engine.engine]).search({ query: 'guide site:missing.test' })
+
+    expect(result).toEqual({
+      notices: ['no results matched `site:missing.test`; the constraint was relaxed'],
+      sources: [{ url: 'https://available.test/guide', title: 'Guide' }],
+      truncated: false,
+    })
+  })
+
   it('preserves original ranks when duplicate URL variants cast one vote', async () => {
     const first = stubEngine('startpage', {
       sources: [

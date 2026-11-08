@@ -7,8 +7,9 @@
  * @module @hy-sde-org/dsh-web-search-public/engines/mojeek
  */
 
-import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
+import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
+import { formatScraperQuery, MOJEEK_QUERY_SYNTAX, type PublicSearchRequest } from '../query.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { classifyChallengePage } from './challenge.ts'
 import { acceptSearchPage, cleanText, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
@@ -31,8 +32,16 @@ export class MojeekEngine implements PublicEngine {
 
   constructor(private readonly userAgent: string, private readonly scraper?: PageScraper) { }
 
-  async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
-    const url = `${SEARCH_URL}?${new URLSearchParams({ q: request.query, s: 'NS', l: 'en' })}`
+  async search(request: PublicSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+    const count = Math.min(Math.max((request.maxResults ?? 9) + 1, 1), 20)
+    const params = new URLSearchParams({
+      q: formatScraperQuery(request.query, request.parsedQuery, MOJEEK_QUERY_SYNTAX),
+      s: 'NS',
+      t: String(count),
+      l: 'en',
+    })
+    if (request.recency !== undefined) params.set('since', request.recency)
+    const url = `${SEARCH_URL}?${params}`
     const page = await browserFetch(url, {
       userAgent: this.userAgent,
       ...(signal !== undefined ? { signal } : {}),

@@ -5,24 +5,32 @@
  * @module @hy-sde-org/dsh-web-search-public/engines/startpage
  */
 
-import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
+import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
+import { formatScraperQuery, type PublicSearchRequest } from '../query.ts'
 import { classifyChallengePage } from './challenge.ts'
 import { acceptSearchPage, anchors, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
 import { fetchHtml } from './http.ts'
 
 const HOME_URL = 'https://www.startpage.com/'
 const SEARCH_URL = 'https://www.startpage.com/sp/search'
+const RECENCY_TO_WITH_DATE = { day: 'd', week: 'w', month: 'm', year: 'y' } as const
+
 
 export class StartpageEngine implements PublicEngine {
   readonly id: PublicEngineId = 'startpage'
 
   constructor(private readonly userAgent: string) {}
 
-  async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+  async search(request: PublicSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
     const home = await fetchHtml({ url: HOME_URL, userAgent: this.userAgent, signal })
     const hidden = collectHiddenInputs(home)
-    const form = new URLSearchParams({ ...hidden, query: request.query, lang: 'english' })
+    const form = new URLSearchParams({
+      ...hidden,
+      query: formatScraperQuery(request.query, request.parsedQuery),
+      lang: 'english',
+    })
+    if (request.recency !== undefined) form.set('with_date', RECENCY_TO_WITH_DATE[request.recency])
     const html = await fetchHtml({
       url: SEARCH_URL,
       method: 'POST',

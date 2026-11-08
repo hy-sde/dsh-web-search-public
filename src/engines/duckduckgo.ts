@@ -3,13 +3,57 @@
  * @module @hy-sde-org/dsh-web-search-public/engines/duckduckgo
  */
 
-import type { WebSearchRequest, WebSearchSource } from '@deepseek-ai/dsh-web'
+import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
+import { DUCKDUCKGO_QUERY_SYNTAX, formatScraperQuery, parseSearchQuery, type PublicSearchRequest } from '../query.ts'
 import { classifyChallengePage } from './challenge.ts'
 import { acceptSearchPage, anchors, cleanText, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
 import { fetchHtml } from './http.ts'
 
 const HTML_ENDPOINT = 'https://html.duckduckgo.com/html/'
+const RECENCY_TO_DF = { day: 'd', week: 'w', month: 'm', year: 'y' } as const
+/** DuckDuckGo's documented `kl` locale values. */
+const DDG_KL_CODES: Readonly<Record<string, true>> = {
+  'xa-ar': true, 'xa-en': true, 'ar-es': true, 'au-en': true, 'at-de': true,
+  'be-fr': true, 'be-nl': true, 'br-pt': true, 'bg-bg': true, 'ca-en': true,
+  'ca-fr': true, 'ct-ca': true, 'cl-es': true, 'cn-zh': true, 'co-es': true,
+  'hr-hr': true, 'cz-cs': true, 'dk-da': true, 'ee-et': true, 'fi-fi': true,
+  'fr-fr': true, 'de-de': true, 'gr-el': true, 'hk-tzh': true, 'hu-hu': true,
+  'in-en': true, 'id-id': true, 'id-en': true, 'ie-en': true, 'il-he': true,
+  'it-it': true, 'jp-jp': true, 'kr-kr': true, 'lv-lv': true, 'lt-lt': true,
+  'xl-es': true, 'my-ms': true, 'my-en': true, 'mx-es': true, 'nl-nl': true,
+  'nz-en': true, 'no-no': true, 'pe-es': true, 'ph-en': true, 'ph-tl': true,
+  'pl-pl': true, 'pt-pt': true, 'ro-ro': true, 'ru-ru': true, 'sg-en': true,
+  'sk-sk': true, 'sl-sl': true, 'za-en': true, 'es-es': true, 'se-sv': true,
+  'ch-de': true, 'ch-fr': true, 'ch-it': true, 'tw-tzh': true, 'th-th': true,
+  'tr-tr': true, 'ua-uk': true, 'uk-en': true, 'us-en': true, 'ue-es': true,
+  've-es': true, 'vn-vi': true, 'wt-wt': true,
+}
+
+/** BCP 47 locales whose DuckDuckGo code is not a component swap. */
+const DDG_LOCALE_ALIASES: Readonly<Record<string, string>> = {
+  'ca-es': 'ct-ca',
+  'en-gb': 'uk-en',
+  'es-419': 'xl-es',
+  'es-us': 'ue-es',
+  'ja-jp': 'jp-jp',
+  'ko-kr': 'kr-kr',
+  'zh-hk': 'hk-tzh',
+  'zh-tw': 'tw-tzh',
+}
+
+/** Map a parsed BCP 47 `lang:` value to DuckDuckGo's provider-specific `kl`. */
+export function localeToKl(lang: string | undefined): string | undefined {
+  if (lang === undefined) return undefined
+  const locale = lang.toLowerCase().replaceAll('_', '-')
+  const alias = DDG_LOCALE_ALIASES[locale]
+  if (alias !== undefined) return alias
+  const match = /^([a-z]{2})-([a-z]{2})$/.exec(locale)
+  if (match === null) return undefined
+  const candidate = `${match[2]}-${match[1]}`
+  return DDG_KL_CODES[candidate] === true ? candidate : undefined
+}
+
 
 /** A `WebSearchSource` may use `title`/optional fields; built via guarded assignment. */
 export class DuckDuckGoEngine implements PublicEngine {
@@ -17,11 +61,17 @@ export class DuckDuckGoEngine implements PublicEngine {
 
   constructor(private readonly userAgent: string) {}
 
-  async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+  async search(request: PublicSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+    const parsedQuery = request.parsedQuery ?? parseSearchQuery(request.query)
+    const form = new URLSearchParams({
+      q: formatScraperQuery(request.query, parsedQuery, DUCKDUCKGO_QUERY_SYNTAX),
+      kl: localeToKl(parsedQuery.lang) ?? 'us-en',
+    })
+    if (request.recency !== undefined) form.set('df', RECENCY_TO_DF[request.recency])
     const html = await fetchHtml({
       url: HTML_ENDPOINT,
       method: 'POST',
-      body: new URLSearchParams({ q: request.query, kl: 'us-en' }).toString(),
+      body: form.toString(),
       userAgent: this.userAgent,
       signal,
     })

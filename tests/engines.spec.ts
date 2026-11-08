@@ -416,6 +416,63 @@ describe.each(enginePages)('$id query and challenge classification', ({ id, quer
   })
 })
 
+describe('engine search controls', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it.each(['startpage', 'duckduckgo', 'ecosia', 'google', 'mojeek'] as const)(
+    '%s maps canonical directives and native recency parameters',
+    async (id) => {
+      const requests: Array<{ url: string; body?: string }> = []
+      vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input)
+        requests.push({
+          url,
+          ...(typeof init?.body === 'string' ? { body: init.body } : {}),
+        })
+        if (id === 'startpage' && url === 'https://www.startpage.com/') {
+          return new Response('<form><input type="hidden" name="sc" value="token"></form>', { status: 200 })
+        }
+        return new Response('<p>No results found.</p>', { status: 200 })
+      }))
+
+      const engine = createEngines([id], 'test-agent')[0]!
+      await engine.search({
+        query: 'release domain:example.com since:2026-01-01 lang:en-GB',
+        recency: 'week',
+      })
+
+      const search = requests.at(-1)!
+      const parameters = search.body === undefined
+        ? new URL(search.url).searchParams
+        : new URLSearchParams(search.body)
+      const queryKey = id === 'startpage' ? 'query' : 'q'
+      const supportsAbsoluteDate = id === 'startpage' || id === 'ecosia' || id === 'google'
+      expect(parameters.get(queryKey)).toBe(
+        supportsAbsoluteDate
+          ? 'release site:example.com after:2026-01-01'
+          : 'release site:example.com',
+      )
+      if (id === 'duckduckgo') expect(parameters.get('kl')).toBe('uk-en')
+
+      const expectedRecency = {
+        startpage: ['with_date', 'w'],
+        duckduckgo: ['df', 'w'],
+        ecosia: [undefined, undefined],
+        google: ['tbs', 'qdr:w'],
+        mojeek: ['since', 'week'],
+      } as const
+      const [recencyKey, recencyValue] = expectedRecency[id]
+      if (recencyKey === undefined) {
+        expect([...parameters.keys()]).not.toContain('freshness')
+      } else {
+        expect(parameters.get(recencyKey)).toBe(recencyValue)
+      }
+    },
+  )
+})
+
 describe('browser-backed challenge recovery', () => {
   afterEach(() => {
     vi.unstubAllGlobals()

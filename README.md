@@ -146,6 +146,16 @@ fetch provider and `tool-web` row.
   then best rank, then engine order. The most informative snippet wins; the earlier engine’s
   title/URL win equal-rank ties. The provider returns the full merged list; the web seam caps
   it to the request's `maxResults` and sets `truncated` itself.
+- Queries are parsed once before retries. Classic operators — quoted phrases, negation, `OR`,
+  `site:`, `inurl:`, `intitle:`, `intext:`, `filetype:`, `after:`/`before:`, and
+  `lang:` aliases — are canonicalized for each engine's supported syntax; recognized BCP 47
+  `lang:` values map to DuckDuckGo's `kl` locale codes. Observable site, URL, title, filetype,
+  and publication-date constraints are applied to the consensus-merged sources. A dimension
+  that would erase every result is relaxed and returned as a notice instead of silently
+  producing an empty search.
+- `recency: day|week|month|year` maps to Startpage `with_date`, DuckDuckGo `df`, Google
+  `tbs`, and Mojeek `since`. Ecosia has no reliable independent recency parameter and ignores
+  the field rather than switching topic or ranking mode.
 - Each engine still runs under its own `AbortSignal.timeout(timeoutMs)` race, so an engine
   that ignores the aggregate’s cancellation dies at its own cap.
 - **Rate-limit resilience is best-effort, layered, and verdict-driven.** Engine outcomes are
