@@ -48,6 +48,19 @@ export async function readHtmlResponse(response: Response): Promise<string> {
   return new TextDecoder().decode(bytes)
 }
 
+/**
+ * A fetched response: body text plus the classification inputs (status,
+ * `cf-mitigated` and `content-type` headers) the challenge scanner needs.
+ */
+export interface FetchedHtml {
+  html: string
+  status: number
+  /** `cf-mitigated` header value, or `null` when the response had none. */
+  cfMitigated: string | null
+  /** `content-type` header value, or `null` when the response had none. */
+  contentType: string | null
+}
+
 export interface FetchHtmlOptions {
   url: string
   method?: 'GET' | 'POST'
@@ -60,14 +73,18 @@ export interface FetchHtmlOptions {
 }
 
 /**
- * Fetch and return the response body text. Redirects are rejected before any
- * `Location` target is contacted (the web-package AGENTS.md rule); a non-2xx
- * response fails with an {@link EngineSearchFailure} carrying the status (4xx
+ * Fetch and return the response body text plus classification metadata.
+ * Redirects are rejected before any `Location` target is contacted (the
+ * web-package AGENTS.md rule). The body is read BEFORE status is judged so
+ * callers can classify non-2xx pages (challenge walls are non-2xx bodies):
+ * use {@link isOkStatus} and the engines/challenge.ts scanner on the
+ * returned {@link FetchedHtml}; a plain non-2xx without challenge evidence
+ * fails with an {@link EngineSearchFailure} carrying the status (4xx
  * hard-blocks that engine, 5xx is retryable). Redirect rejections and network
  * failures propagate as `TypeError`s — the provider's legacy signatures
  * classify them as retryable transport problems.
  */
-export async function fetchHtml(options: FetchHtmlOptions): Promise<string> {
+export async function fetchHtml(options: FetchHtmlOptions): Promise<FetchedHtml> {
   const headers: Record<string, string> = {
     'user-agent': options.userAgent,
     accept: 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5',
@@ -81,6 +98,15 @@ export async function fetchHtml(options: FetchHtmlOptions): Promise<string> {
   if (options.body !== undefined) init.body = options.body
   if (options.signal !== undefined) init.signal = options.signal
   const response = await fetch(options.url, init)
-  if (!response.ok) throw new EngineSearchFailure('http', `HTTP ${response.status}`, response.status)
-  return await readHtmlResponse(response)
+  return {
+    html: await readHtmlResponse(response),
+    status: response.status,
+    cfMitigated: response.headers.get('cf-mitigated'),
+    contentType: response.headers.get('content-type'),
+  }
+}
+
+/** Whether a response status counts as successful (2xx). */
+export function isOkStatus(status: number): boolean {
+  return status >= 200 && status < 300
 }
