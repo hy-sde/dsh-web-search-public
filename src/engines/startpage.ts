@@ -8,9 +8,9 @@
 import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
 import { formatScraperQuery, type PublicSearchRequest } from '../query.ts'
-import { classifyChallengePage } from './challenge.ts'
+import { challengePageInput, classifyChallengeResponse, describeChallenge } from './challenge.ts'
 import { acceptSearchPage, anchors, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
-import { fetchHtml } from './http.ts'
+import { fetchHtml, isOkStatus } from './http.ts'
 
 const HOME_URL = 'https://www.startpage.com/'
 const SEARCH_URL = 'https://www.startpage.com/sp/search'
@@ -24,25 +24,34 @@ export class StartpageEngine implements PublicEngine {
 
   async search(request: PublicSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
     const home = await fetchHtml({ url: HOME_URL, userAgent: this.userAgent, signal })
-    const hidden = collectHiddenInputs(home)
+    if (!isOkStatus(home.status)) {
+      throw new EngineSearchFailure('http', `HTTP ${home.status}`, home.status)
+    }
+    const hidden = collectHiddenInputs(home.html)
     const form = new URLSearchParams({
       ...hidden,
       query: formatScraperQuery(request.query, request.parsedQuery),
       lang: 'english',
     })
     if (request.recency !== undefined) form.set('with_date', RECENCY_TO_WITH_DATE[request.recency])
-    const html = await fetchHtml({
+    const page = await fetchHtml({
       url: SEARCH_URL,
       method: 'POST',
       body: form.toString(),
       userAgent: this.userAgent,
       signal,
     })
-    const sources = parseStartpage(html, Number.POSITIVE_INFINITY)
-    if (sources.length === 0 && classifyChallengePage(html) !== undefined) {
-      throw new EngineSearchFailure('challenge', 'startpage answered with a bot challenge page')
+    const sources = parseStartpage(page.html, Number.POSITIVE_INFINITY)
+    if (sources.length === 0) {
+      const verdict = classifyChallengeResponse(challengePageInput(page))
+      if (verdict !== undefined) {
+        throw new EngineSearchFailure('challenge', `startpage answered with a bot challenge page (${describeChallenge(verdict)})`)
+      }
     }
-    return acceptSearchPage(this.id, html, sources)
+    if (!isOkStatus(page.status)) {
+      throw new EngineSearchFailure('http', `HTTP ${page.status}`, page.status)
+    }
+    return acceptSearchPage(this.id, page.html, sources)
   }
 }
 

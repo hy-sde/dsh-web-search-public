@@ -29,6 +29,13 @@ cost of thinner consensus.
 | Google | consent-cookie scrape of `div#search` `<h3>` anchors | consent/JS wall → challenge; optional browser escalation |
 | Mojeek | `ul.results-standard` / `li` / `h2` anchors + `p.s` | ALTCHA wall → challenge; optional browser escalation |
 
+
+Challenge classification mirrors the harness-core rule: a `cf-mitigated: challenge` response
+header or a live `js_challenge` form field names the protection on any status, body markers
+(`_cf_chl_opt`, `captcha-delivery.com`, `px-captcha`, …) are trusted only on non-2xx responses,
+and structural DOM evidence names the protection only when the page yielded zero organic
+results. An ordinary 2xx page that merely quotes or embeds these markers is not a wall.
+
 The engine list and markup are validated by the opt-in real test
 (`DSH_WEB_SEARCH_REAL_E2E=1 npm run test:real`). Engine markup changes (or bot-challenge
 policy changes) are the main reason a parser breaks; re-run the real test after any parser

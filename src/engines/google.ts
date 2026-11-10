@@ -12,7 +12,7 @@ import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { PublicEngine, PublicEngineId } from '../types.ts'
 import { EngineSearchFailure } from '../types.ts'
 import { formatScraperQuery, type PublicSearchRequest } from '../query.ts'
-import { classifyChallengePage } from './challenge.ts'
+import { challengePageInput, classifyChallengeResponse, describeChallenge, type ChallengeVerdict } from './challenge.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { acceptSearchPage, cleanText, dedupeSources, elementText, elementsByClass, isUsableUrl, parseAttrs, stripNoise } from './html.ts'
 
@@ -26,15 +26,27 @@ const RECENCY_TO_TBS = { day: 'qdr:d', week: 'qdr:w', month: 'qdr:m', year: 'qdr
 const CONSENT_COOKIE = 'CONSENT=YES+cb.20231217-14-p0.en+FX+116; SOCS=CAISHAgBEhJnd3NfMjAyNTAxMDgtMF9SQzIaAmVuIAEaBgiA_LipBg'
 
 /**
+ * Detect blocking responses and challenge evidence (response-header, live-form
+ * or structural DOM) with verdict detail, not terms in query/result text.
+ * @param page Loaded search response.
+ * @returns A challenge verdict, `'traffic'` for status-only walls, or `undefined` for an accepted page.
+ */
+export function blockVerdict(page: LoadedHtmlPage): ChallengeVerdict | 'traffic' | undefined {
+  if (page.status === 403 || page.status === 429 || page.url.includes('/sorry/')) return 'traffic'
+  const verdict = classifyChallengeResponse(challengePageInput(page))
+  if (verdict === undefined || parseGoogle(page.html, 1).length > 0) return undefined
+  return verdict
+}
+
+/**
  * Detect blocking responses and challenge markup, not terms in query/result text.
  * @param page Loaded search response.
  * @returns The block reason, or `undefined` for an accepted page.
  */
 export function blockReason(page: LoadedHtmlPage): 'javascript' | 'traffic' | undefined {
-  if (page.status === 403 || page.status === 429 || page.url.includes('/sorry/')) return 'traffic'
-  const kind = classifyChallengePage(page.html)
-  if (kind === undefined || parseGoogle(page.html, 1).length > 0) return undefined
-  return kind === 'javascript' ? 'javascript' : 'traffic'
+  const verdict = blockVerdict(page)
+  if (verdict === undefined) return undefined
+  return verdict === 'traffic' || verdict.protection !== 'JavaScript challenge' ? 'traffic' : 'javascript'
 }
 
 export class GoogleEngine implements PublicEngine {
@@ -69,9 +81,10 @@ export class GoogleEngine implements PublicEngine {
     // Block classification is independent of browser availability: without a
     // scraper there is no escalation path, and a known block page must become
     // a structured challenge failure — never a successful empty search.
-    const blocked = blockReason(page)
-    if (blocked !== undefined) {
-      throw new EngineSearchFailure('challenge', `google answered with a bot challenge page (${blocked})`)
+    const verdict = blockVerdict(page)
+    if (verdict !== undefined) {
+      const detail = typeof verdict === 'string' ? verdict : describeChallenge(verdict)
+      throw new EngineSearchFailure('challenge', `google answered with a bot challenge page (${detail})`)
     }
     return acceptSearchPage(this.id, page.html, parseGoogle(page.html, Number.POSITIVE_INFINITY))
   }

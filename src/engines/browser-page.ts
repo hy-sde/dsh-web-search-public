@@ -25,6 +25,7 @@
 
 import { EngineSearchFailure } from '../types.ts'
 import { buildBrowserNavigationHeaders } from './browser-headers.ts'
+import { challengePageInput, describeChallenge, scanChallengePage, type ChallengeVerdict } from './challenge.ts'
 import { readHtmlResponse } from './http.ts'
 
 /** Maximum rendered HTML characters accepted from browser escalation. */
@@ -40,11 +41,21 @@ function assertRenderedHtmlLimit(page: LoadedHtmlPage): LoadedHtmlPage {
   return page
 }
 
-/** HTML plus the response status and final URL after redirects or browser navigation. */
+/**
+ * HTML plus the response status and final URL after redirects or browser
+ * navigation. `contentType`/`cfMitigated` carry the plain-fetch response
+ * headers when known (`undefined` for browser-rendered loads, which are HTML
+ * by construction and keep the engine predicates as the sole challenge
+ * authority).
+ */
 export interface LoadedHtmlPage {
   html: string
   status: number
   url: string
+  /** `content-type` header from the plain fetch, when available. */
+  contentType?: string | null
+  /** `cf-mitigated` header from the plain fetch, when available. */
+  cfMitigated?: string | null
 }
 
 /**
@@ -163,7 +174,24 @@ async function fetchHtmlPage(url: string, options: BrowserFetchOptions): Promise
     }
     throw error
   }
-  return { html: await readHtmlResponse(response), status: response.status, url: response.url || url }
+  return {
+    html: await readHtmlResponse(response),
+    status: response.status,
+    url: response.url || url,
+    contentType: response.headers.get('content-type'),
+    cfMitigated: response.headers.get('cf-mitigated'),
+  }
+}
+
+/**
+ * The fork-harmonized response scan (cf-mitigated header, live challenge
+ * form, non-2xx vendor markers) over a loaded page. Structural DOM evidence
+ * is deliberately NOT part of this scan: browser escalation must not widen
+ * on a results page that merely embeds a widget — DOM detection stays the
+ * engine predicates' job behind the zero-organic-results guard.
+ */
+function pageChallenge(page: LoadedHtmlPage): ChallengeVerdict | undefined {
+  return scanChallengePage(challengePageInput(page))
 }
 
 /**
@@ -243,21 +271,32 @@ export async function browserFetch(url: string, options: BrowserFetchOptions): P
   if (fallback === undefined || options.fetchImpl !== undefined) {
     // No escalation available: a clean non-2xx page is a structured http
     // failure instead of a body the engines would parse (fetch-only engines
-    // must not scrape a 503 response into "sources").
+    // must not scrape a 503 response into "sources"). A non-2xx page carrying
+    // challenge evidence (header, live form or vendor marker) names the
+    // protection instead.
+    const verdict = pageChallenge(page)
     if (!(page.status >= 200 && page.status < 300)) {
+      if (verdict !== undefined) {
+        throw new EngineSearchFailure(
+          'challenge',
+          `bot challenge (${describeChallenge(verdict)}; HTTP ${page.status}) and no browser service mounted to escalate`,
+        )
+      }
       throw new EngineSearchFailure('http', `HTTP ${page.status}`, page.status)
     }
     return page
   }
   const isSuccessful = page.status >= 200 && page.status < 300
-  if (isSuccessful && !fallback.shouldFallback(page)) return page
+  if (isSuccessful && !fallback.shouldFallback(page) && pageChallenge(page) === undefined) return page
   return browseHtmlPage(url, fallback, options.pageTimeoutMs ?? BROWSER_PAGE_TIMEOUT_MS, options.signal, (): never => {
     // The trigger was a status/challenge, so the missing browser turns it into
     // the structured failure it warrants (a 5xx stays `http`, not `challenge`).
-    if (fallback.shouldFallback(page)) {
+    const verdict = pageChallenge(page)
+    if (fallback.shouldFallback(page) || verdict !== undefined) {
+      const detail = verdict === undefined ? '' : `${describeChallenge(verdict)}; `
       throw new EngineSearchFailure(
         'challenge',
-        `bot challenge (HTTP ${page.status}) and no browser service mounted to escalate`,
+        `bot challenge (${detail}HTTP ${page.status}) and no browser service mounted to escalate`,
       )
     }
     throw new EngineSearchFailure('http', `HTTP ${page.status}`, page.status)

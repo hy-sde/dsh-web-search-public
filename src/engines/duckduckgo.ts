@@ -6,9 +6,9 @@
 import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
 import { DUCKDUCKGO_QUERY_SYNTAX, formatScraperQuery, parseSearchQuery, type PublicSearchRequest } from '../query.ts'
-import { classifyChallengePage } from './challenge.ts'
+import { challengePageInput, classifyChallengeResponse, describeChallenge } from './challenge.ts'
 import { acceptSearchPage, anchors, cleanText, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
-import { fetchHtml } from './http.ts'
+import { fetchHtml, isOkStatus } from './http.ts'
 
 const HTML_ENDPOINT = 'https://html.duckduckgo.com/html/'
 const RECENCY_TO_DF = { day: 'd', week: 'w', month: 'm', year: 'y' } as const
@@ -68,18 +68,24 @@ export class DuckDuckGoEngine implements PublicEngine {
       kl: localeToKl(parsedQuery.lang) ?? 'us-en',
     })
     if (request.recency !== undefined) form.set('df', RECENCY_TO_DF[request.recency])
-    const html = await fetchHtml({
+    const page = await fetchHtml({
       url: HTML_ENDPOINT,
       method: 'POST',
       body: form.toString(),
       userAgent: this.userAgent,
       signal,
     })
-    const sources = parseDuckDuckGo(html, Number.POSITIVE_INFINITY)
-    if (sources.length === 0 && classifyChallengePage(html) !== undefined) {
-      throw new EngineSearchFailure('challenge', 'duckduckgo answered with a bot challenge page')
+    const sources = parseDuckDuckGo(page.html, Number.POSITIVE_INFINITY)
+    if (sources.length === 0) {
+      const verdict = classifyChallengeResponse(challengePageInput(page))
+      if (verdict !== undefined) {
+        throw new EngineSearchFailure('challenge', `duckduckgo answered with a bot challenge page (${describeChallenge(verdict)})`)
+      }
     }
-    return acceptSearchPage(this.id, html, sources)
+    if (!isOkStatus(page.status)) {
+      throw new EngineSearchFailure('http', `HTTP ${page.status}`, page.status)
+    }
+    return acceptSearchPage(this.id, page.html, sources)
   }
 }
 

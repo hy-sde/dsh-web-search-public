@@ -11,7 +11,7 @@ import type { PublicEngine, PublicEngineId } from '../types.ts'
 import { EngineSearchFailure } from '../types.ts'
 import { formatScraperQuery, type PublicSearchRequest } from '../query.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
-import { classifyChallengePage } from './challenge.ts'
+import { challengePageInput, classifyChallengeResponse, describeChallenge, type ChallengeVerdict } from './challenge.ts'
 import { acceptSearchPage, anchors, dedupeSources, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
 
 const SEARCH_URL = 'https://www.ecosia.org/search'
@@ -19,13 +19,24 @@ const ECOSIA_HOME_URL = 'https://www.ecosia.org/'
 const RESULT_RENDER_TIMEOUT_MS = 10_000
 
 /**
+ * Detect challenge evidence (response-header, live-form or structural DOM)
+ * with verdict detail, without rejecting query echoes.
+ * @param page Loaded search response.
+ * @returns The challenge verdict, or `undefined` when the page is a usable result page.
+ */
+export function blockedVerdict(page: LoadedHtmlPage): ChallengeVerdict | undefined {
+  const verdict = classifyChallengeResponse(challengePageInput(page))
+  if (verdict === undefined || parseEcosia(page.html, 1).length > 0) return undefined
+  return verdict
+}
+
+/**
  * Detect blocking statuses and challenge markup without rejecting query echoes.
  * @param page Loaded search response.
  * @returns Whether browser escalation or a challenge failure is required.
  */
 export function isBlockedPage(page: LoadedHtmlPage): boolean {
-  return page.status === 403 || page.status === 429
-    || (classifyChallengePage(page.html) !== undefined && parseEcosia(page.html, 1).length === 0)
+  return page.status === 403 || page.status === 429 || blockedVerdict(page) !== undefined
 }
 
 export class EcosiaEngine implements PublicEngine {
@@ -54,7 +65,8 @@ export class EcosiaEngine implements PublicEngine {
     // scraper there is no escalation path, and a known block page must become
     // a structured challenge failure — never a successful empty search.
     if (isBlockedPage(page)) {
-      throw new EngineSearchFailure('challenge', 'ecosia answered with a bot challenge page')
+      const verdict = blockedVerdict(page)
+      throw new EngineSearchFailure('challenge', `ecosia answered with a bot challenge page${verdict === undefined ? '' : ` (${describeChallenge(verdict)})`}`)
     }
     return acceptSearchPage(this.id, page.html, parseEcosia(page.html, Number.POSITIVE_INFINITY))
   }

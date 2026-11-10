@@ -11,7 +11,7 @@ import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
 import { formatScraperQuery, MOJEEK_QUERY_SYNTAX, type PublicSearchRequest } from '../query.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
-import { classifyChallengePage } from './challenge.ts'
+import { challengePageInput, classifyChallengeResponse, describeChallenge, type ChallengeVerdict } from './challenge.ts'
 import { acceptSearchPage, cleanText, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
 
 const SEARCH_URL = 'https://www.mojeek.com/search'
@@ -19,12 +19,24 @@ const MOJEEK_HOME_URL = 'https://www.mojeek.com/?arc=none&lang=en&lb=en&theme=da
 const CAPTCHA_SOLVE_TIMEOUT_MS = 45_000
 
 /**
+ * Detect challenge markup (response-header, live-form or structural DOM
+ * evidence) only when no organic results are available.
+ * @param page Loaded search response.
+ * @returns The challenge verdict, or `undefined` when the page is a usable result page.
+ */
+export function robotVerdict(page: LoadedHtmlPage): ChallengeVerdict | undefined {
+  const verdict = classifyChallengeResponse(challengePageInput(page))
+  if (verdict === undefined || parseMojeek(page.html, 1).length > 0) return undefined
+  return verdict
+}
+
+/**
  * Detect challenge markup only when no organic results are available.
  * @param page Loaded search response.
  * @returns Whether browser escalation or a challenge failure is required.
  */
 export function isRobotPage(page: LoadedHtmlPage): boolean {
-  return classifyChallengePage(page.html) !== undefined && parseMojeek(page.html, 1).length === 0
+  return robotVerdict(page) !== undefined
 }
 
 export class MojeekEngine implements PublicEngine {
@@ -59,11 +71,12 @@ export class MojeekEngine implements PublicEngine {
         }
         : {}),
     })
+    const verdict = robotVerdict(page)
     // Block classification is independent of browser availability: without a
     // scraper there is no escalation path, and a known block page must become
     // a structured challenge failure — never a successful empty search.
-    if (isRobotPage(page)) {
-      throw new EngineSearchFailure('challenge', 'mojeek answered with a bot challenge page')
+    if (verdict !== undefined) {
+      throw new EngineSearchFailure('challenge', `mojeek answered with a bot challenge page (${describeChallenge(verdict)})`)
     }
     return acceptSearchPage(this.id, page.html, parseMojeek(page.html, Number.POSITIVE_INFINITY))
   }

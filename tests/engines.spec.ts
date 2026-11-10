@@ -4,7 +4,13 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { classifyChallengePage } from '../src/engines/challenge.ts'
+import {
+  CHALLENGE_PAGE_MAX_CHARS,
+  classifyChallengePage,
+  classifyChallengeResponse,
+  scanChallengePage,
+  type ChallengePageInput,
+} from '../src/engines/challenge.ts'
 import type { PageScraper } from '../src/engines/browser-page.ts'
 import { createEngines } from '../src/engines/index.ts'
 import { parseDuckDuckGo, unwrapDdgHref } from '../src/engines/duckduckgo.ts'
@@ -12,6 +18,7 @@ import { parseEcosia, isBlockedPage } from '../src/engines/ecosia.ts'
 import { parseGoogle, unwrapGoogleHref, blockReason } from '../src/engines/google.ts'
 import { parseMojeek, isRobotPage } from '../src/engines/mojeek.ts'
 import { collectHiddenInputs, parseStartpage } from '../src/engines/startpage.ts'
+import { fetchHtml } from '../src/engines/http.ts'
 import { enginePages, queryEchoPage, SEARCH_SOURCE } from './search-pages.ts'
 
 describe('unwrapDdgHref', () => {
@@ -381,7 +388,114 @@ describe('classifyChallengePage', () => {
   })
 })
 
-describe.each(enginePages)('$id query and challenge classification', ({ id, query, resultHtml, wallHtml }) => {
+describe('scanChallengePage', () => {
+  const htmlInput = (overrides: Partial<ChallengePageInput>): ChallengePageInput => ({
+    status: 200,
+    body: '<html><body><p>No results found.</p></body></html>',
+    ...overrides,
+  })
+
+  it('trusts the cf-mitigated header on any status (case-insensitive value)', () => {
+    expect(scanChallengePage(htmlInput({ status: 200, cfMitigated: 'challenge', contentType: 'text/html' })))
+      .toEqual({ protection: 'Cloudflare', source: 'cf-mitigated-header' })
+    expect(scanChallengePage(htmlInput({ status: 503, cfMitigated: 'Challenge', contentType: 'text/html' })))
+      .toEqual({ protection: 'Cloudflare', source: 'cf-mitigated-header' })
+  })
+
+  it('trusts a live js_challenge form field on any status', () => {
+    const body = '<form method="post"><input type="hidden" name="js_challenge" value="1"></form>'
+    expect(scanChallengePage(htmlInput({ body, contentType: 'text/html' })))
+      .toEqual({ protection: 'JavaScript challenge', source: 'challenge-form' })
+    expect(scanChallengePage(htmlInput({ status: 403, body, contentType: 'text/html' })))
+      .toEqual({ protection: 'JavaScript challenge', source: 'challenge-form' })
+  })
+
+  it('matches an entity-encoded js_challenge field name', () => {
+    const body = '<form><input type="hidden" name="js&#95;challenge" value="1"></form>'
+    expect(scanChallengePage(htmlInput({ body, contentType: 'text/html' })))
+      .toEqual({ protection: 'JavaScript challenge', source: 'challenge-form' })
+  })
+
+  it('ignores a js_challenge field quoted inside comments, raw text, or templates', () => {
+    for (const [open, close] of [
+      ['<!-- ', ' -->'],
+      ['<script>', '</script>'],
+      ['<textarea>', '</textarea>'],
+      ['<title>', '</title>'],
+      ['<template>', '</template>'],
+    ] as const) {
+      const body = `<form>${open}<input name="js_challenge">${close}</form>`
+      expect(scanChallengePage(htmlInput({ body, contentType: 'text/html' }))).toBeUndefined()
+    }
+  })
+
+  it('suppresses quoted vendor markers on 2xx responses', () => {
+    const body = '<article><p>The bootstrap sets _cf_chl_opt and px-captcha talks to captcha-delivery.com.</p></article>'
+    expect(scanChallengePage(htmlInput({ body, contentType: 'text/html' }))).toBeUndefined()
+  })
+
+  it('names vendor markers only on non-2xx responses, in fixed precedence order', () => {
+    expect(scanChallengePage(htmlInput({ status: 403, body: '<p>_cf_chl_opt missing</p>', contentType: 'text/html' })))
+      .toEqual({ protection: 'Cloudflare', source: 'page-marker' })
+    expect(scanChallengePage(htmlInput({ status: 503, body: '<p>captcha-delivery.com denied you</p>', contentType: 'text/html' })))
+      .toEqual({ protection: 'DataDome', source: 'page-marker' })
+    expect(scanChallengePage(htmlInput({ status: 429, body: '<div id="px-captcha"></div>', contentType: 'text/html' })))
+      .toEqual({ protection: 'PerimeterX', source: 'page-marker' })
+    expect(scanChallengePage(htmlInput({ status: 403, body: '<p>blocked by network security</p>', contentType: 'text/html' })))
+      .toEqual({ protection: 'network security block', source: 'page-marker' })
+    expect(scanChallengePage(htmlInput({ status: 403, body: '<p>_cf_chl_opt px-captcha</p>', contentType: 'text/html' })))
+      .toEqual({ protection: 'Cloudflare', source: 'page-marker' })
+  })
+
+  it('skips the form check on oversize bodies but keeps marker evidence', () => {
+    const body = `<form><input name="js_challenge"></form>${'x'.repeat(CHALLENGE_PAGE_MAX_CHARS)}`
+    expect(scanChallengePage(htmlInput({ body, contentType: 'text/html' }))).toBeUndefined()
+    expect(scanChallengePage(htmlInput({ status: 403, body: `${body}<p>_cf_chl_opt</p>`, contentType: 'text/html' })))
+      .toEqual({ protection: 'Cloudflare', source: 'page-marker' })
+  })
+
+  it('scans only HTML content types', () => {
+    const body = '<p>_cf_chl_opt</p>'
+    expect(scanChallengePage(htmlInput({ status: 403, body, contentType: 'application/json' }))).toBeUndefined()
+    expect(scanChallengePage(htmlInput({ status: 403, body, contentType: 'text/plain' }))).toBeUndefined()
+    expect(scanChallengePage(htmlInput({ status: 403, body, contentType: null }))).toBeUndefined()
+    expect(scanChallengePage(htmlInput({ status: 403, body, contentType: 'Text/HTML; charset=utf-8' })))
+      .toEqual({ protection: 'Cloudflare', source: 'page-marker' })
+    expect(scanChallengePage(htmlInput({ status: 403, body, contentType: 'application/xhtml+xml' })))
+      .toEqual({ protection: 'Cloudflare', source: 'page-marker' })
+    expect(scanChallengePage(htmlInput({ status: 403, body }))).toEqual({ protection: 'Cloudflare', source: 'page-marker' })
+  })
+})
+
+describe('classifyChallengeResponse', () => {
+  it('keeps structural DOM evidence authoritative on 2xx pages', () => {
+    expect(classifyChallengeResponse({ status: 200, body: '<div class="g-recaptcha" data-sitekey="k"></div>', contentType: 'text/html' }))
+      .toEqual({ protection: 'reCAPTCHA', source: 'dom-marker' })
+    expect(classifyChallengeResponse({ status: 200, body: '<div class="captcha-wrap"><altcha-widget></altcha-widget></div>', contentType: 'text/html' }))
+      .toEqual({ protection: 'ALTCHA', source: 'dom-marker' })
+    expect(classifyChallengeResponse({ status: 200, body: '<form action="//duckduckgo.com/anomaly.js?sv=html" method="post"></form>', contentType: 'text/html' }))
+      .toEqual({ protection: 'DuckDuckGo', source: 'dom-marker' })
+    expect(classifyChallengeResponse({ status: 200, body: '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate"></script>', contentType: 'text/html' }))
+      .toEqual({ protection: 'Cloudflare', source: 'dom-marker' })
+    expect(classifyChallengeResponse({ status: 200, body: '<script src="//client.perimeterx.net/ABC/main.min.js"></script>', contentType: 'text/html' }))
+      .toEqual({ protection: 'PerimeterX', source: 'dom-marker' })
+    expect(classifyChallengeResponse({ status: 200, body: '<meta http-equiv="refresh" content="0; url=/httpservice/retry/enablejs">', contentType: 'text/html' }))
+      .toEqual({ protection: 'JavaScript challenge', source: 'dom-marker' })
+  })
+
+  it('gives response-scan tiers precedence over DOM evidence', () => {
+    const body = '<div class="g-recaptcha"></div><p>_cf_chl_opt</p>'
+    expect(classifyChallengeResponse({ status: 403, body, contentType: 'text/html' }))
+      .toEqual({ protection: 'Cloudflare', source: 'page-marker' })
+  })
+
+  it('stays silent on an ordinary empty 2xx page', () => {
+    expect(classifyChallengeResponse({ status: 200, body: '<html><body><p>No results found.</p></body></html>', contentType: 'text/html' }))
+      .toBeUndefined()
+  })
+})
+
+describe.each(enginePages)('$id query and challenge classification', ({ id, query, resultHtml, wallHtml, wallProtection }) => {
   afterEach(() => {
     vi.unstubAllGlobals()
   })
@@ -392,7 +506,7 @@ describe.each(enginePages)('$id query and challenge classification', ({ id, quer
     { name: 'organic results', body: resultHtml, sources: [SEARCH_SOURCE] },
   ]) {
     it.each(browserModes)(`accepts query echoes with ${name} (browser configured: %s)`, async browserConfigured => {
-      vi.stubGlobal('fetch', vi.fn(async () => new Response(queryEchoPage(query, body), { status: 200 })))
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(queryEchoPage(query, body), { status: 200, headers: { 'content-type': 'text/html' } })))
       const scrape = vi.fn<PageScraper>(async () => { throw new Error('Unexpected browser escalation') })
       const engine = createEngines([id], 'test-agent', browserConfigured ? scrape : undefined)[0]!
       await expect(engine.search({ query })).resolves.toEqual(sources)
@@ -401,18 +515,117 @@ describe.each(enginePages)('$id query and challenge classification', ({ id, quer
   }
 
   it('rejects a genuine challenge without a browser scraper', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(wallHtml, { status: 200 })))
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(wallHtml, { status: 200, headers: { 'content-type': 'text/html' } })))
     const engine = createEngines([id], 'test-agent')[0]!
     await expect(engine.search({ query })).rejects.toMatchObject({ kind: 'challenge' })
+  })
+
+  it('names the challenge protection from structural evidence', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(wallHtml, { status: 200, headers: { 'content-type': 'text/html' } })))
+    const engine = createEngines([id], 'test-agent')[0]!
+    await expect(engine.search({ query })).rejects.toMatchObject({
+      kind: 'challenge',
+      message: expect.stringContaining(`${wallProtection} via page structure`),
+    })
   })
 
   it('rejects an unrecognized HTTP-200 page as retryable invalid data', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(
       '<html><head><title>Service unavailable</title></head><body>Maintenance in progress.</body></html>',
-      { status: 200 },
+      { status: 200, headers: { 'content-type': 'text/html' } },
     )))
     const engine = createEngines([id], 'test-agent')[0]!
     await expect(engine.search({ query })).rejects.toMatchObject({ kind: 'invalidResponse' })
+  })
+})
+
+describe('harmonized challenge gating', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it.each(enginePages)('$id accepts a 2xx page that merely quotes vendor markers', async ({ id, query }) => {
+    const article = '<html><head><title>Web filter field notes</title></head><body><article>'
+      + '<p>Vendors embed _cf_chl_opt bootstraps, captcha-delivery.com endpoints and px-captcha widgets in their docs.</p>'
+      + '<p>No results found.</p></article></body></html>'
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(article, { status: 200, headers: { 'content-type': 'text/html' } })))
+    const scrape = vi.fn<PageScraper>(async () => { throw new Error('Unexpected browser escalation') })
+    const engine = createEngines([id], 'test-agent', scrape)[0]!
+    await expect(engine.search({ query })).resolves.toEqual([])
+    expect(scrape).not.toHaveBeenCalled()
+  })
+
+  it('classifies a 403 marker wall as a named challenge (duckduckgo)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html><body>_cf_chl_opt bootstrap missing</body></html>', { status: 403, headers: { 'content-type': 'text/html' } })))
+    const engine = createEngines(['duckduckgo'], 'test-agent')[0]!
+    await expect(engine.search({ query: 'anything' })).rejects.toMatchObject({
+      kind: 'challenge',
+      message: expect.stringContaining('duckduckgo answered with a bot challenge page (Cloudflare via page marker)'),
+    })
+  })
+
+  it('reports a clean 503 as an http failure, not a challenge (duckduckgo)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>upstream unavailable</p>', { status: 503, headers: { 'content-type': 'text/html' } })))
+    const engine = createEngines(['duckduckgo'], 'test-agent')[0]!
+    await expect(engine.search({ query: 'anything' })).rejects.toMatchObject({ kind: 'http', status: 503 })
+  })
+
+  it('trusts a cf-mitigated header on a 200 response (duckduckgo)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>No results found.</p>', {
+      status: 200,
+      headers: { 'cf-mitigated': 'challenge', 'content-type': 'text/html' },
+    })))
+    const engine = createEngines(['duckduckgo'], 'test-agent')[0]!
+    await expect(engine.search({ query: 'anything' })).rejects.toMatchObject({
+      kind: 'challenge',
+      message: expect.stringContaining('Cloudflare via cf-mitigated header'),
+    })
+  })
+
+  it('trusts a live js_challenge form on a 200 response (startpage)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (url === 'https://www.startpage.com/') {
+        return new Response('<form><input type="hidden" name="sc" value="token"></form>', { status: 200, headers: { 'content-type': 'text/html' } })
+      }
+      return new Response(
+        '<form method="post"><input type="hidden" name="js_challenge" value="1"><p>No results found.</p></form>',
+        { status: 200, headers: { 'content-type': 'text/html' } },
+      )
+    }))
+    const engine = createEngines(['startpage'], 'test-agent')[0]!
+    await expect(engine.search({ query: 'anything' })).rejects.toMatchObject({
+      kind: 'challenge',
+      message: expect.stringContaining('JavaScript challenge via challenge form'),
+    })
+  })
+})
+
+describe('fetchHtml', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('returns html, status and response headers without throwing on non-2xx', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>walled</p>', {
+      status: 403,
+      headers: { 'cf-mitigated': 'challenge', 'content-type': 'text/html' },
+    })))
+    await expect(fetchHtml({ url: 'https://e.test/search', userAgent: 'test-agent' })).resolves.toEqual({
+      html: '<p>walled</p>',
+      status: 403,
+      cfMitigated: 'challenge',
+      contentType: 'text/html',
+    })
+  })
+
+  it('still rejects oversized bodies as retryable invalid data', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>huge</p>', {
+      status: 200,
+      headers: { 'content-length': String(3 * 1024 * 1024) },
+    })))
+    await expect(fetchHtml({ url: 'https://e.test/search', userAgent: 'test-agent' }))
+      .rejects.toMatchObject({ kind: 'invalidResponse' })
   })
 })
 
@@ -432,9 +645,9 @@ describe('engine search controls', () => {
           ...(typeof init?.body === 'string' ? { body: init.body } : {}),
         })
         if (id === 'startpage' && url === 'https://www.startpage.com/') {
-          return new Response('<form><input type="hidden" name="sc" value="token"></form>', { status: 200 })
+          return new Response('<form><input type="hidden" name="sc" value="token"></form>', { status: 200, headers: { 'content-type': 'text/html' } })
         }
-        return new Response('<p>No results found.</p>', { status: 200 })
+        return new Response('<p>No results found.</p>', { status: 200, headers: { 'content-type': 'text/html' } })
       }))
 
       const engine = createEngines([id], 'test-agent')[0]!
@@ -481,7 +694,7 @@ describe('browser-backed challenge recovery', () => {
   it.each(enginePages.filter(({ id }) => id === 'google' || id === 'ecosia' || id === 'mojeek'))(
     '$id accepts query echoes in the page returned after escalation',
     async ({ id, query, resultHtml, wallHtml }) => {
-      vi.stubGlobal('fetch', vi.fn(async () => new Response(wallHtml, { status: 200 })))
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(wallHtml, { status: 200, headers: { 'content-type': 'text/html' } })))
       const scrape: PageScraper = async url => ({ url, status: 200, html: queryEchoPage(query, resultHtml) })
       const engine = createEngines([id], 'test-agent', scrape)[0]!
       await expect(engine.search({ query })).resolves.toEqual([SEARCH_SOURCE])
@@ -491,7 +704,7 @@ describe('browser-backed challenge recovery', () => {
   it('rejects a Google enable-JavaScript redirect without a scraper', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(
       '<meta http-equiv="refresh" content="0; url=/httpservice/retry/enablejs">',
-      { status: 200 },
+      { status: 200, headers: { 'content-type': 'text/html' } },
     )))
     const engine = createEngines(['google'], 'test-agent')[0]!
     await expect(engine.search({ query: 'anything' })).rejects.toMatchObject({ kind: 'challenge' })

@@ -255,4 +255,57 @@ describe('browserFetch', () => {
       browser: { scrape, shouldFallback: () => false },
     })).rejects.toMatchObject({ kind: 'invalidResponse' })
   })
+
+  it('escalates a clean-looking 2xx page carrying the cf-mitigated header', async () => {
+    const fetch = fetchMock()
+    fetch.mockResolvedValue(new Response(SERP, {
+      status: 200,
+      headers: { 'content-type': 'text/html', 'cf-mitigated': 'challenge' },
+    }))
+    const scrape = vi.fn(async (url: string) => ({ html: SERP, status: 200, url }))
+    const page = await browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+      browser: { scrape, shouldFallback: () => false },
+    })
+    expect(page.html).toBe(SERP)
+    expect(scrape).toHaveBeenCalledTimes(1)
+  })
+
+  it('names the wall protection when an unescalatable non-2xx page carries vendor markers', async () => {
+    const fetch = fetchMock()
+    fetch.mockResolvedValue(new Response('<p>px-captcha wall</p>', {
+      status: 503,
+      headers: { 'content-type': 'text/html' },
+    }))
+    await expect(browserFetch('https://www.mojeek.com/search?q=x', {
+      userAgent: UA,
+    })).rejects.toMatchObject({
+      kind: 'challenge',
+      message: expect.stringContaining('PerimeterX via page marker'),
+    })
+  })
+
+  it('keeps a clean non-2xx page an http failure when no escalation trigger fires', async () => {
+    const fetch = fetchMock()
+    fetch.mockResolvedValue(new Response('down', { status: 503, headers: { 'content-type': 'text/html' } }))
+    await expect(browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+    })).rejects.toMatchObject({ kind: 'http', status: 503 })
+  })
+
+  it('names the wall protection when the browser service is unavailable on a marker wall', async () => {
+    const fetch = fetchMock()
+    fetch.mockResolvedValue(new Response('<p>captcha-delivery.com interstitial</p>', {
+      status: 403,
+      headers: { 'content-type': 'text/html' },
+    }))
+    const scrape = vi.fn(async () => { throw new BrowserUnavailableError() })
+    await expect(browserFetch('https://www.google.com/search?q=x', {
+      userAgent: UA,
+      browser: { scrape, shouldFallback: () => true },
+    })).rejects.toMatchObject({
+      kind: 'challenge',
+      message: expect.stringContaining('DataDome via page marker'),
+    })
+  })
 })
