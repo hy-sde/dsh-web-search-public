@@ -17,17 +17,30 @@ import type { PublicEngine } from '../src/types.ts'
 const ENABLED = process.env.DSH_WEB_SEARCH_REAL_E2E === '1'
 
 describe.skipIf(!ENABLED)('live engines (DSH_WEB_SEARCH_REAL_E2E=1)', () => {
-  it.each<[string, () => PublicEngine]>([
+  for (const [name, make] of [
     ['startpage', () => new StartpageEngine(DEFAULT_USER_AGENT)],
     ['duckduckgo', () => new DuckDuckGoEngine(DEFAULT_USER_AGENT)],
     ['mojeek', () => new MojeekEngine(DEFAULT_USER_AGENT)],
-  ])('%s returns organic results for a real query', async (_, make) => {
-    const sources = await make().search({ query: 'deepseek r1 open weights', maxResults: 3 })
-    expect(sources.length).toBeGreaterThan(0)
-    for (const source of sources) {
-      expect(source.url).toMatch(/^https?:\/\//)
-    }
-  })
+  ] as [string, () => PublicEngine][]) {
+    it(`${name} returns organic results for a real query`, async (ctx) => {
+      try {
+        const sources = await make().search({ query: 'deepseek r1 open weights', maxResults: 3 })
+        expect(sources.length).toBeGreaterThan(0)
+        for (const source of sources) {
+          expect(source.url).toMatch(/^https?:\/\//)
+        }
+      } catch (error) {
+        // A live engine may bot-challenge the runner's network at any time; that is
+        // an environmental outcome (the engine code classifies it correctly), not a
+        // scraper regression. Skip, and only fail on genuine scraper/transport errors.
+        if (error instanceof EngineSearchFailure && error.kind === 'challenge') {
+          ctx.skip(true, `${name} is bot-challenged from this network right now`)
+          return
+        }
+        throw error
+      }
+    })
+  }
 
   it('bot-challenged engines fail forward instead of crashing', async () => {
     for (const make of [
@@ -47,9 +60,10 @@ describe.skipIf(!ENABLED)('live engines (DSH_WEB_SEARCH_REAL_E2E=1)', () => {
     }
   })
 
-  it('one run is a full chain pass: at least the first non-challenged engine answers', async () => {
-    // End-to-end: walk the real engines the same way PublicSearchProvider does and
-    // require that at least one organic result is found somewhere in the chain.
+  it('one run is a full chain pass: at least one engine answers the fan-out', async () => {
+    // End-to-end: walk the real engines the same way PublicSearchProvider does —
+    // all engines in parallel — and require that at least one organic result is
+    // found somewhere in the chain.
     const engines = [
       new StartpageEngine(DEFAULT_USER_AGENT),
       new DuckDuckGoEngine(DEFAULT_USER_AGENT),
@@ -57,15 +71,12 @@ describe.skipIf(!ENABLED)('live engines (DSH_WEB_SEARCH_REAL_E2E=1)', () => {
       new GoogleEngine(DEFAULT_USER_AGENT),
       new MojeekEngine(DEFAULT_USER_AGENT),
     ]
-    let sources = 0
-    for (const engine of engines) {
-      try {
-        sources = (await engine.search({ query: 'deepseek', maxResults: 3 })).length
-        if (sources > 0) break
-      } catch {
-        // challenged or transport error — advance
-      }
-    }
-    expect(sources).toBeGreaterThan(0)
+    const settled = await Promise.allSettled(
+      engines.map((engine) => engine.search({ query: 'deepseek', maxResults: 3 })),
+    )
+    const answered = settled.filter(
+      (entry) => entry.status === 'fulfilled' && entry.value.length > 0,
+    )
+    expect(answered.length).toBeGreaterThan(0)
   })
 })
