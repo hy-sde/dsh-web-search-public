@@ -15,6 +15,8 @@ import z from '@deepseek-ai/schemastery'
 import type { } from '@deepseek-ai/dsh-web'
 import { createEngines } from './engines/index.ts'
 import { BrowserUnavailableError, type PageScraper } from './engines/browser-page.ts'
+// Compile-time host-browser compatibility assertion (see src/host-browser-compat.ts).
+import './host-browser-compat.ts'
 import {
   DEFAULT_ENGINE_BACKOFF_MS,
   DEFAULT_FAILURE_COOLDOWN_MS,
@@ -104,6 +106,19 @@ export interface Config {
   engineBackoffMs?: number
   /** Cap for the doubled per-engine circuit-breaker window. Default: 3600000 (1h). */
   maxEngineBackoffMs?: number
+  /**
+   * When a positive query constraint (site/inurl/intitle/intext/filetype) would
+   * erase every remaining source, relax it (reported via the result's
+   * `notices`) instead of returning an empty result. Negative filters are
+   * never relaxed. Default: false (explicit intent is honored strictly).
+   */
+  readonly relaxPositiveConstraints?: boolean
+  /**
+   * Maximum in-flight engine operations per engine, shared across all
+   * concurrent searches; extra operations queue for a slot, bounded by the
+   * aggregate hard deadline. Default: 1; 0 disables the limiter.
+   */
+  readonly maxConcurrentPerEngine?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -117,6 +132,8 @@ export const Config: z<Config> = z.object({
   failureCooldownMs: z.number().step(1).min(0).default(DEFAULT_FAILURE_COOLDOWN_MS),
   engineBackoffMs: z.number().step(1).min(0).default(DEFAULT_ENGINE_BACKOFF_MS),
   maxEngineBackoffMs: z.number().step(1).min(0).default(DEFAULT_MAX_ENGINE_BACKOFF_MS),
+  relaxPositiveConstraints: z.boolean().default(false),
+  maxConcurrentPerEngine: z.number().step(1).min(0).default(1),
 })
 
 /** Configured timeout and deadlines must be positive integers; hard must not precede soft. */
@@ -142,6 +159,8 @@ function assertNonNegativeInteger(name: string, value: number): void {
  * warrants (a challenge stays a challenge and trips the breaker honestly; a
  * transport failure keeps its retryable classification) instead of silently
  * staying fetch-only.
+ * Compatibility with the host `BrowserService.fetchPageHtml` signature is
+ * asserted at compile time in `src/host-browser-compat.ts`.
  */
 function resolveBrowserScraper(ctx: Context): PageScraper {
   return (url, options) => {
@@ -194,6 +213,12 @@ export function apply(ctx: Context, config: Config): void {
   const maxEngineBackoffMs = config.maxEngineBackoffMs !== undefined
     ? config.maxEngineBackoffMs
     : DEFAULT_MAX_ENGINE_BACKOFF_MS
+  const relaxPositiveConstraints = config.relaxPositiveConstraints !== undefined
+    ? config.relaxPositiveConstraints
+    : false
+  const maxConcurrentPerEngine = config.maxConcurrentPerEngine !== undefined
+    ? config.maxConcurrentPerEngine
+    : 1
   assertPositiveInteger('timeoutMs', timeoutMs)
   assertPositiveInteger('softDeadlineMs', softDeadlineMs)
   assertPositiveInteger('hardDeadlineMs', hardDeadlineMs)
@@ -202,6 +227,7 @@ export function apply(ctx: Context, config: Config): void {
   assertNonNegativeInteger('failureCooldownMs', failureCooldownMs)
   assertNonNegativeInteger('engineBackoffMs', engineBackoffMs)
   assertNonNegativeInteger('maxEngineBackoffMs', maxEngineBackoffMs)
+  assertNonNegativeInteger('maxConcurrentPerEngine', maxConcurrentPerEngine)
   if (hardDeadlineMs < softDeadlineMs) {
     throw new Error('web-search-public: hardDeadlineMs must be >= softDeadlineMs')
   }
@@ -218,6 +244,8 @@ export function apply(ctx: Context, config: Config): void {
     failureCooldownMs,
     engineBackoffMs,
     maxEngineBackoffMs,
+    relaxPositiveConstraints,
+    maxConcurrentPerEngine,
   })
   ctx.web.registerSearchProvider(provider)
   // Unloading aborts in-flight searches and drains them (async disposers are

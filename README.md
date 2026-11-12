@@ -9,8 +9,10 @@
 A zero-API-key web search provider for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 With a single `web_search` call it **fans the query out to all five public engines in
 parallel — Startpage, DuckDuckGo, Ecosia, Google, Mojeek** — and consolidates the answers by
-cross-engine consensus, so no single engine's bot challenge, timeout, or empty page can
-degrade the search. No API keys, no accounts, no fetch provider, no setup.
+cross-engine consensus, so a single engine's bot challenge, timeout, or empty page is
+absorbed by the others rather than failing the search — though coverage can shrink, and an
+empty result names which engines contributed and which were blocked. No API keys, no
+accounts, no fetch provider, no setup.
 
 | Identity | Value |
 | --- | --- |
@@ -149,10 +151,17 @@ fetch provider and `tool-web` row.
 - Queries are parsed once before retries. Classic operators — quoted phrases, negation, `OR`,
   `site:`, `inurl:`, `intitle:`, `intext:`, `filetype:`, `after:`/`before:`, and
   `lang:` aliases — are canonicalized for each engine's supported syntax; recognized BCP 47
-  `lang:` values map to DuckDuckGo's `kl` locale codes. Observable site, URL, title, filetype,
-  and publication-date constraints are applied to the consensus-merged sources. A dimension
-  that would erase every result is relaxed and returned as a notice instead of silently
-  producing an empty search.
+  `lang:` values map to DuckDuckGo's `kl` locale codes. Boolean structure is preserved rather
+  than rewritten: `OR` chains between same-field directives (`intitle:guide OR intitle:manual`)
+  stay disjunctions in both the per-engine query strings and the local filter, and any
+  unsupported Boolean combination (parenthesized groups, mixed term/directive chains) is
+  passed through verbatim — the engines enforce it and the local constraint filter stands
+  down instead of guessing at meaning. Observable site, URL, title, filetype, and
+  publication-date constraints are applied to the consensus-merged sources. Explicit negative
+  filters (`-site:…`) are never relaxed: when every result is excluded, the call returns `[]`
+  with a notice naming the filter. Positive constraints are strict by default as well
+  (`relaxPositiveConstraints: false`); opting in restores the older behavior where a dimension
+  that would erase every result is relaxed and returned as a notice.
 - `recency: day|week|month|year` maps to Startpage `with_date`, DuckDuckGo `df`, Google
   `tbs`, and Mojeek `since`. Ecosia has no reliable independent recency parameter and ignores
   the field rather than switching topic or ranking mode.
@@ -165,7 +174,9 @@ fetch provider and `tool-web` row.
   breaker. Retryable transport, HTTP 5xx, oversized, and unrecognized-page failures retry the
   whole fan-out after an exponential backoff (`maxRetries`/`retryDelayMs`, abort-aware sleep);
   hard blocks are never retried. Once retries are exhausted—or every engine is down—the
-  provider fast-fails for `failureCooldownMs`. A verified no-results page is a query-level
+  provider fast-fails for `failureCooldownMs`; a search that reaches an engine while the
+  cooldown is armed (an overlapping call, for example) clears it, so the window measures
+  from the last failure, not the first. A verified no-results page is a query-level
   verdict: it returns `[]`, is not retried, and does not trip the breaker.
 - Unloading the plugin aborts in-flight searches and drains them before unload completes
   (a disposed provider answers new searches with `WEB_PROVIDER_UNAVAILABLE`).
@@ -174,7 +185,11 @@ fetch provider and `tool-web` row.
 - Only if **no engine produced an accepted page** does the provider throw `WEB_PROVIDER_ERROR`
   with each engine’s reason (`id: <reason>; …`) — engines that were still running at the hard
   deadline are listed as `did not settle before the hard deadline`. If at least one engine
-  accepted the search and found nothing, the call succeeds with `[]` (`truncated: false`).
+  accepted the search and found nothing, the call succeeds with `[]` (`truncated: false`);
+  when other engines failed or were skipped in the same fan-out, the result carries a
+  model-visible notice explaining the degraded coverage, e.g.
+  `no engine returned results (startpage: no results; ecosia: challenge wall)` — so the
+  distinction between a genuine empty answer and a blocked fan-out stays visible.
 
 The worst case for the default configuration is ≈ `hardDeadlineMs` (30 s) overall — the
 deadline is the whole budget for the search including retries and their backoff — well under
@@ -212,6 +227,8 @@ All options are optional; constants fill the defaults. Configure via the plugin 
 | `failureCooldownMs` | `300000` | fast-fail window (ms) after an all-engines-down failure (retry exhausted, or every engine hard-blocked/tripped): searches in this window return a clear `retry in about Ns` error instead of re-blasting engines that just throttled us (which would deepen the block). `0` disables the window. |
 | `engineBackoffMs` | `300000` | base per-engine circuit-breaker window (ms): an engine that hard-blocks (HTTP 4xx), answers with a challenge wall, or is still pending at the hard deadline is skipped for this long instead of being re-blasted on every search. Doubles per consecutive trip up to `maxEngineBackoffMs`; resets after a successful probe. `0` disables the per-engine breaker. |
 | `maxEngineBackoffMs` | `3600000` | cap for the doubled per-engine circuit-breaker window (ms). |
+| `relaxPositiveConstraints` | `false` | whether a positive constraint (`site:`, `intitle:`, …) that would erase every result is relaxed with a notice instead of returning `[]`. `false` keeps positive filters strict — an over-narrow filter returns an empty result naming the filter — while explicit negative filters (`-site:…`) are never relaxed either way. |
+| `maxConcurrentPerEngine` | `1` | cap on simultaneously in-flight operations **per engine across all overlapping searches**. Queued work neither contacts the engine nor consumes its per-engine timeout, queue waits respect caller aborts, and a queue wait that would outlive the aggregate hard deadline is denied without a network request. `0` disables the cap. |
 | `userAgent` | browser-shaped constant | User-Agent sent to the engines (deliberately not the product UA) |
 
 ```yaml
@@ -227,6 +244,8 @@ All options are optional; constants fill the defaults. Configure via the plugin 
     failureCooldownMs: 300000
     engineBackoffMs: 300000
     maxEngineBackoffMs: 3600000
+    relaxPositiveConstraints: false
+    maxConcurrentPerEngine: 1
 ```
 
 `PublicEngineId` values are the exported engine ids; any id outside the known set is dropped
@@ -254,7 +273,9 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
   cookies retained by the mounted browser service's scraper context.
 - **Treat queries as public.** Each query is sent to several public search engines. Do not
   search for secrets or PII you would not paste into a public search box.
-- **Amplification is inherent.** Every search contacts every configured engine concurrently.
+- **Amplification is bounded but real.** Every search contacts every configured engine, and
+  overlapping searches share each engine's `maxConcurrentPerEngine` slot budget (default one
+  in-flight operation per engine) rather than multiplying load without limit.
   Startpage alone uses a homepage GET plus a search POST; browser escalation may add home-page
   navigation, redirects, and subresource requests. See [docs/operations.md](docs/operations.md).
 - **Responses are bounded.** Plain-fetch HTML is limited to 2 MiB before parsing; browser

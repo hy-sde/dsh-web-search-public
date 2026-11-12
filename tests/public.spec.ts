@@ -79,6 +79,8 @@ type ProviderOverrides = Partial<{
   failureCooldownMs: number
   engineBackoffMs: number
   maxEngineBackoffMs: number
+  relaxPositiveConstraints: boolean
+  maxConcurrentPerEngine: number
 }>
 
 function provider(engines: PublicEngine[], overrides: ProviderOverrides = {}): PublicSearchProvider {
@@ -195,12 +197,13 @@ describe('PublicSearchProvider', () => {
     })
   })
 
-  it('reports a constraint relaxed to preserve otherwise valid search results', async () => {
+  it('reports a constraint relaxed only when relaxation is opted in', async () => {
     const engine = stubEngine('startpage', {
       sources: [{ url: 'https://available.test/guide', title: 'Guide' }],
     })
 
-    const result = await provider([engine.engine]).search({ query: 'guide site:missing.test' })
+    const result = await provider([engine.engine], { relaxPositiveConstraints: true })
+      .search({ query: 'guide site:missing.test' })
 
     expect(result).toEqual({
       notices: ['no results matched `site:missing.test`; the constraint was relaxed'],
@@ -566,8 +569,207 @@ describe('PublicSearchProvider', () => {
     const blocked = stubEngine('startpage', { error: new Error('HTTP 403') })
     const empty = stubEngine('duckduckgo', { sources: [] })
     const result = await provider([blocked.engine, empty.engine]).search({ query: 'q' })
-    // The accepted empty page is a legitimate answer, not an aggregate failure.
-    expect(result).toEqual({ sources: [], truncated: false })
+    // The accepted empty page is a legitimate answer, not an aggregate failure —
+    // but the failed engine must be reported as degraded coverage, not silence.
+    expect(result).toEqual({
+      notices: ['no engine returned results (startpage: HTTP 403)'],
+      sources: [],
+      truncated: false,
+    })
+  })
+
+  it('keeps positive constraints strict unless relaxation is opted in', async () => {
+    const engine = stubEngine('startpage', {
+      sources: [{ url: 'https://available.test/guide', title: 'Guide' }],
+    })
+
+    const strict = await provider([engine.engine]).search({ query: 'guide site:missing.test' })
+    expect(strict).toEqual({
+      notices: ['every returned result was filtered out by `site:missing.test`'],
+      sources: [],
+      truncated: false,
+    })
+
+    const relaxed = await provider([engine.engine], { relaxPositiveConstraints: true })
+      .search({ query: 'guide site:missing.test' })
+    expect(relaxed).toEqual({
+      notices: ['no results matched `site:missing.test`; the constraint was relaxed'],
+      sources: [{ url: 'https://available.test/guide', title: 'Guide' }],
+      truncated: false,
+    })
+  })
+
+  it('never relaxes explicit negative filters', async () => {
+    const engine = stubEngine('startpage', {
+      sources: [{ url: 'https://blocked.test/guide', title: 'Guide' }],
+    })
+
+    const result = await provider([engine.engine], { relaxPositiveConstraints: true })
+      .search({ query: 'guide -site:blocked.test' })
+
+    expect(result).toEqual({
+      notices: ['every returned result was filtered out by `-site:blocked.test`'],
+      sources: [],
+      truncated: false,
+    })
+  })
+
+  it('explains degraded coverage when accepted empties mix with engine failures', async () => {
+    const walled = stubEngine('startpage', { error: new EngineSearchFailure('challenge', 'challenge wall') })
+    const empty = stubEngine('duckduckgo', { sources: [] })
+
+    const result = await provider([walled.engine, empty.engine]).search({ query: 'q' })
+
+    // Accepted-empty is still not an aggregate failure, but the result must
+    // say why it is empty rather than look like an ordinary no-hits page.
+    expect(result).toEqual({
+      notices: ['no engine returned results (startpage: challenge wall)'],
+      sources: [],
+      truncated: false,
+    })
+  })
+
+  it('clears the aggregate cooldown when a concurrent search reaches an engine', async () => {
+    const gates: Array<(ok: boolean) => void> = []
+    let calls = 0
+    const engine: PublicEngine = {
+      id: 'mojeek',
+      async search(): Promise<WebSearchSource[]> {
+        calls += 1
+        const ok = await new Promise<boolean>(resolve => gates.push(resolve))
+        if (!ok) throw new Error('HTTP 403')
+        return [{ url: 'https://ok.test/1', title: 'OK' }]
+      },
+    }
+    const subject = provider([engine], {
+      failureCooldownMs: 60_000,
+      engineBackoffMs: 0,
+      maxConcurrentPerEngine: 0,
+    })
+    try {
+      // Two overlapping searches against one engine: the first attempt parks
+      // on its gate, the second is released to succeed after the failure.
+      const failing = subject.search({ query: 'q' }).catch((error: unknown) => error)
+      const succeeding = subject.search({ query: 'q' })
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(gates).toHaveLength(2)
+
+      gates[0]!(false)
+      const failure = await failing as { code?: string }
+      expect(failure.code).toBe('WEB_PROVIDER_ERROR')
+      gates[1]!(true)
+      expect(await succeeding).toMatchObject({ sources: [{ url: 'https://ok.test/1' }] })
+
+      // The success is more recent than the aggregate failure: the next search
+      // reaches the engine instead of fast-failing through the cooldown.
+      const third = subject.search({ query: 'q' })
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(calls).toBe(3)
+      gates[2]!(true)
+      expect(await third).toMatchObject({ sources: [{ url: 'https://ok.test/1' }] })
+    } finally {
+      await subject.dispose()
+    }
+  })
+
+  it('bounds concurrent engine operations across overlapping searches', async () => {
+    const gates: Array<() => void> = []
+    let active = 0
+    let maxActive = 0
+    const engine: PublicEngine = {
+      id: 'mojeek',
+      async search(): Promise<WebSearchSource[]> {
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await new Promise<void>(resolve => gates.push(resolve))
+        active -= 1
+        return [{ url: 'https://ok.test/1', title: 'OK' }]
+      },
+    }
+    const subject = provider([engine])
+    try {
+      const searches = [
+        subject.search({ query: 'q1' }),
+        subject.search({ query: 'q2' }),
+        subject.search({ query: 'q3' }),
+      ]
+      await new Promise(resolve => setTimeout(resolve, 10))
+      // Default maxConcurrentPerEngine is 1: the three searches serialize.
+      expect(maxActive).toBe(1)
+      expect(gates).toHaveLength(1)
+      while (gates.length > 0) {
+        gates.shift()!()
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      const results = await Promise.all(searches)
+      expect(results).toHaveLength(3)
+      expect(results.every(result => result.sources.length === 1)).toBe(true)
+    } finally {
+      await subject.dispose()
+    }
+  })
+
+  it('fails a queued search past the hard deadline without contacting the engine', async () => {
+    const gates: Array<() => void> = []
+    const engine: PublicEngine = {
+      id: 'mojeek',
+      async search(_request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+        await new Promise<void>((resolve, reject) => {
+          gates.push(resolve)
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+        return []
+      },
+    }
+    const subject = provider([engine], { hardDeadlineMs: 100, timeoutMs: 5_000 })
+    try {
+      const first = subject.search({ query: 'q1' }).catch((error: unknown) => error)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      const queued = subject.search({ query: 'q2' }).catch((error: unknown) => error)
+
+      const firstError = await first as { code?: string }
+      expect(firstError.code).toBe('WEB_PROVIDER_ERROR')
+      const queuedError = await queued as { message?: string }
+      expect(queuedError.message)
+        .toContain('mojeek: queued for a concurrency slot past the hard deadline')
+      expect(gates).toHaveLength(1)
+    } finally {
+      await subject.dispose()
+    }
+  })
+
+  it('cancels a queued search when its request aborts', async () => {
+    const gates: Array<() => void> = []
+    let calls = 0
+    const engine: PublicEngine = {
+      id: 'mojeek',
+      async search(_request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
+        calls += 1
+        await new Promise<void>((resolve, reject) => {
+          gates.push(resolve)
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+        return [{ url: 'https://ok.test/1', title: 'OK' }]
+      },
+    }
+    const subject = provider([engine])
+    const controller = new AbortController()
+    try {
+      const first = subject.search({ query: 'q1' })
+      await new Promise(resolve => setTimeout(resolve, 10))
+      const queued = subject.search({ query: 'q2' }, controller.signal)
+        .catch((error: unknown) => error)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      controller.abort()
+      const queuedError = await queued as { code?: string }
+      expect(queuedError.code).toBe('WEB_ABORTED')
+      // The queued request never reached the engine.
+      expect(calls).toBe(1)
+      gates.shift()!()
+      expect(await first).toMatchObject({ sources: [{ url: 'https://ok.test/1' }] })
+    } finally {
+      await subject.dispose()
+    }
   })
 
   it('counts one vote per canonical URL within a single engine answer', async () => {
@@ -884,5 +1086,131 @@ describe('plugin boot', () => {
     expect(fetchMock.mock.calls.some(call => String(call[0]).includes('startpage.com'))).toBe(true)
     await fiber.dispose()
     delete process.env.DSH_WEB_SEARCH_PROVIDER
+  })
+  it('plumbs relaxation and concurrency options through the plugin config', async () => {
+    vi.stubGlobal('fetch', routerFixture())
+    const ctx = new Context()
+    await ctx.plugin(WebRuntime, { searchProvider: PUBLIC_PROVIDER_ID })
+    const fiber = await ctx.plugin(publicPlugin, {
+      engines: ['duckduckgo'],
+      softDeadlineMs: 50,
+      hardDeadlineMs: 500,
+      maxRetries: 0,
+      relaxPositiveConstraints: true,
+      maxConcurrentPerEngine: 2,
+    })
+    try {
+      // Relaxation is opt-in end to end: the config flag flips the default.
+      const relaxed = await ctx.web.search({ query: 'example site:missing.test' })
+      expect(relaxed.sources).toHaveLength(2)
+      // The seam forwards provider notices at runtime; the 0.2.2-rc.1
+      // WebSearchResult type does not declare them yet.
+      expect((relaxed as { notices?: readonly string[] }).notices)
+        .toContain('no results matched `site:missing.test`; the constraint was relaxed')
+    } finally {
+      await fiber.dispose()
+    }
+
+    const strictCtx = new Context()
+    await strictCtx.plugin(WebRuntime, { searchProvider: PUBLIC_PROVIDER_ID })
+    const strictFiber = await strictCtx.plugin(publicPlugin, {
+      engines: ['duckduckgo'],
+      softDeadlineMs: 50,
+      hardDeadlineMs: 500,
+      maxRetries: 0,
+      maxConcurrentPerEngine: 2,
+    })
+    try {
+      // Without the flag the same query empties with an explanation instead
+      // of silently relaxing the user's constraint.
+      const strict = await strictCtx.web.search({ query: 'example site:missing.test' })
+      expect(strict.sources).toHaveLength(0)
+      expect((strict as { notices?: readonly string[] }).notices)
+        .toContain('every returned result was filtered out by `site:missing.test`')
+    } finally {
+      await strictFiber.dispose()
+    }
+  })
+
+  it('resolves the browser bridge when the browser service mounts after the provider', async () => {
+    class BrowserProbe extends Service {
+      constructor(ctx: Context) {
+        super(ctx, 'browser')
+      }
+
+      async fetchPageHtml(url: string): Promise<{ html: string; status: number; url: string }> {
+        return {
+          html: '<div id="search"><a href="https://browser.test/late"><h3>Mounted Late</h3></a></div>',
+          status: 200,
+          url,
+        }
+      }
+    }
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('blocked', { status: 403 })))
+    const ctx = new Context()
+    await ctx.plugin(WebRuntime, { searchProvider: PUBLIC_PROVIDER_ID })
+    const fiber = await ctx.plugin(publicPlugin, {
+      engines: ['google'],
+      softDeadlineMs: 50,
+      hardDeadlineMs: 500,
+      maxRetries: 0,
+    })
+    const browserFiber = await ctx.plugin(BrowserProbe)
+    try {
+      await expect(ctx.web.search({ query: 'example' })).resolves.toMatchObject({
+        sources: [{ url: 'https://browser.test/late', title: 'Mounted Late' }],
+      })
+    } finally {
+      await fiber.dispose()
+      await browserFiber.dispose()
+    }
+  })
+
+  it('unloads cleanly and remounts with the browser bridge in a fresh context', async () => {
+    class BrowserProbe extends Service {
+      constructor(ctx: Context) {
+        super(ctx, 'browser')
+      }
+
+      async fetchPageHtml(url: string): Promise<{ html: string; status: number; url: string }> {
+        return {
+          html: '<div id="search"><a href="https://browser.test/again"><h3>Remounted</h3></a></div>',
+          status: 200,
+          url,
+        }
+      }
+    }
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('blocked', { status: 403 })))
+    const mount = async () => {
+      const ctx = new Context()
+      await ctx.plugin(WebRuntime, { searchProvider: PUBLIC_PROVIDER_ID })
+      const browserFiber = await ctx.plugin(BrowserProbe)
+      const fiber = await ctx.plugin(publicPlugin, {
+        engines: ['google'],
+        softDeadlineMs: 50,
+        hardDeadlineMs: 500,
+        maxRetries: 0,
+      })
+      return { ctx, fiber, browserFiber }
+    }
+
+    const first = await mount()
+    await expect(first.ctx.web.search({ query: 'example' })).resolves.toMatchObject({
+      sources: [{ url: 'https://browser.test/again' }],
+    })
+    await first.fiber.dispose()
+    await first.browserFiber.dispose()
+
+    const second = await mount()
+    try {
+      await expect(second.ctx.web.search({ query: 'example' })).resolves.toMatchObject({
+        sources: [{ url: 'https://browser.test/again' }],
+      })
+    } finally {
+      await second.fiber.dispose()
+      await second.browserFiber.dispose()
+    }
   })
 })

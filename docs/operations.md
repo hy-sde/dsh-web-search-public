@@ -64,12 +64,20 @@ change and record what you observed.
    per-engine reasons: challenge, HTTP status, invalid or oversized response, timeout,
    transport error, or hard-deadline expiry.
 2. **One engine is flaky** → the fan-out absorbs it and opens its breaker when applicable.
+   When the survivors return nothing, the result explains why:
+   `no engine returned results (startpage: no results; ecosia: challenge wall)` appears as a
+   model-visible notice, so an empty page is never mistaken for a verified no-match answer.
 3. **A search legitimately has no matches** → only a page with an explicit no-results marker
    is accepted as `[]`; unknown HTTP-200 HTML remains a retryable engine failure.
 4. **Want a different engine set or order** → configure `engines`.
 5. **Want tighter latency or less amplification** → lower `softDeadlineMs`, shorten
-   `engines`, or both.
-6. **Want the DeepSeek route** → set `web.searchProvider: deepseek-official` and provide
+   `engines`, lower `maxConcurrentPerEngine`, or a combination.
+6. **Over-narrow query returns `[]` with a filter notice** → the constraint filter is strict:
+   positive dimensions erase all results instead of being relaxed unless
+   `relaxPositiveConstraints: true` is set, and negative filters (`-site:…`) are always
+   strict. Unsupported Boolean combinations (parentheses, mixed term/directive `OR` chains)
+   are forwarded to the engines verbatim rather than rewritten.
+7. **Want the DeepSeek route** → set `web.searchProvider: deepseek-official` and provide
    `DEEPSEEK_API_KEY`.
 
 ## Privacy hygiene

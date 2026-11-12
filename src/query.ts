@@ -11,6 +11,12 @@ export interface QueryTerm {
   group?: number
 }
 
+/** One same-field OR chain parsed from explicit Boolean syntax (`intitle:a OR intitle:b`). */
+export interface ConstraintOrGroup {
+  field: ConstraintField
+  values: string[]
+}
+
 /** Parsed Google-style search query. */
 export interface StructuredQuery {
   raw: string
@@ -26,11 +32,20 @@ export interface StructuredQuery {
   excludedInText: string[]
   filetypes: string[]
   excludedFiletypes: string[]
+  /** Explicit same-field OR chains between positive directives. */
+  orGroups: ConstraintOrGroup[]
   after?: string
   before?: string
   lang?: string
   hasDirectives: boolean
   hasConstraints: boolean
+  /**
+   * True when the query uses Boolean structure the flat constraint model
+   * cannot represent exactly (parentheses, cross-field OR, negated OR
+   * chains): engines receive the raw text unchanged and local constraint
+   * filtering is skipped rather than rewriting the Boolean meaning.
+   */
+  verbatim: boolean
 }
 
 /** Query-syntax features one public engine accepts. */
@@ -90,10 +105,13 @@ export interface NormalizedPublicSearchRequest extends PublicSearchRequest {
 }
 
 
-/** Result of lenient constraint filtering. */
+/** Result of constraint filtering: kept sources, relaxed dimensions, and any dimension that emptied the result. */
 export interface ConstraintFilterResult {
   sources: WebSearchSource[]
+  /** Labels of positive dimensions relaxed under `relaxPositive`. */
   dropped: string[]
+  /** Label of the constraint that excluded every returned source (reported, never silently relaxed). */
+  emptiedBy?: string
 }
 
 interface RawToken {
@@ -102,7 +120,8 @@ interface RawToken {
   quotedValue?: boolean
 }
 
-type ConstraintField = 'site' | 'inUrl' | 'inTitle' | 'inText' | 'filetype'
+/** Constraint fields with local observable predicates (see {@link constraintDimensions}). */
+export type ConstraintField = 'site' | 'inUrl' | 'inTitle' | 'inText' | 'filetype'
 type AllMode = 'inTitle' | 'inUrl' | 'inText'
 
 const DIRECTIVE_PATTERN = /^([+-]?)([a-z][a-z-]*):(.*)$/i
@@ -273,8 +292,10 @@ export function parseSearchQuery(raw: string): StructuredQuery {
     excludedInText: [],
     filetypes: [],
     excludedFiletypes: [],
+    orGroups: [],
     hasDirectives: false,
     hasConstraints: false,
+    verbatim: false,
   }
   const tokens = tokenize(raw)
   let negateNext = false
@@ -282,34 +303,94 @@ export function parseSearchQuery(raw: string): StructuredQuery {
   let lastWasTerm = false
   let groupSequence = 0
   let allMode: AllMode | undefined
+  // Boolean-structure tracking: `verbatim` marks queries whose Boolean meaning
+  // the flat constraint model cannot represent exactly (parens, cross-field
+  // OR, negated OR chains) — engines then receive the raw text unchanged.
+  let verbatim = false
+  let lastConstraint: { field: ConstraintField; negated: boolean; value: string } | undefined
+  let openGroup: ConstraintOrGroup | undefined
 
-  const pushConstraint = (field: ConstraintField, value: string, negated: boolean): void => {
+  const flatArrayOf = (field: ConstraintField): string[] =>
+    field === 'site'
+      ? query.sites
+      : field === 'inUrl'
+        ? query.inUrl
+        : field === 'inTitle'
+          ? query.inTitle
+          : field === 'inText'
+            ? query.inText
+            : query.filetypes
+
+  const pushConstraint = (field: ConstraintField, value: string, negated: boolean, chained = false): void => {
     query.hasDirectives = true
     orPending = false
     lastWasTerm = false
     const normalized = value.trim()
     if (normalized.length === 0) return
+    let stored = normalized
     if (field === 'site') {
-      const site = normalizeSite(normalized)
-      if (site.length > 0) (negated ? query.excludedSites : query.sites).push(site)
+      stored = normalizeSite(normalized)
+      if (stored.length === 0) return
+    } else if (field === 'filetype') {
+      stored = normalized.toLowerCase().replace(/^\.+/, '')
+      if (stored.length === 0) return
+    }
+    if (chained && !verbatim) {
+      if (!negated) {
+        // An explicit OR chain is representable only between same-field
+        // positive directives: continue an open chain, or convert a flat
+        // same-field predecessor into a new chain.
+        if (openGroup !== undefined && openGroup.field === field) {
+          openGroup.values.push(stored)
+          lastConstraint = { field, negated: false, value: stored }
+          return
+        }
+        const previous = lastConstraint
+        if (previous !== undefined && previous.field === field && !previous.negated
+          && flatArrayOf(field).at(-1) === previous.value) {
+          flatArrayOf(field).pop()
+          openGroup = { field, values: [previous.value, stored] }
+          query.orGroups.push(openGroup)
+          lastConstraint = { field, negated: false, value: stored }
+          return
+        }
+      }
+      // Anything else chained — cross-field OR, negated directives in a chain,
+      // a chain broken by an ungroupable predecessor — is Boolean structure
+      // the flat model cannot represent: pass it through verbatim.
+      verbatim = true
+      openGroup = undefined
+      lastConstraint = undefined
+      return
+    }
+    openGroup = undefined
+    lastConstraint = { field, negated, value: stored }
+    if (field === 'site') {
+      (negated ? query.excludedSites : query.sites).push(stored)
     } else if (field === 'inUrl') {
-      (negated ? query.excludedInUrl : query.inUrl).push(normalized)
+      (negated ? query.excludedInUrl : query.inUrl).push(stored)
     } else if (field === 'inTitle') {
-      (negated ? query.excludedInTitle : query.inTitle).push(normalized)
+      (negated ? query.excludedInTitle : query.inTitle).push(stored)
     } else if (field === 'inText') {
-      (negated ? query.excludedInText : query.inText).push(normalized)
+      (negated ? query.excludedInText : query.inText).push(stored)
     } else {
-      const extension = normalized.toLowerCase().replace(/^\.+/, '')
-      if (extension.length > 0) (negated ? query.excludedFiletypes : query.filetypes).push(extension)
+      (negated ? query.excludedFiletypes : query.filetypes).push(stored)
     }
   }
 
-  const pushTerm = (text: string, phrase: boolean): void => {
+  const pushTerm = (text: string, phrase: boolean, chained = false): void => {
     const negated = negateNext
     negateNext = false
     if (allMode !== undefined) {
-      pushConstraint(allMode, text, negated)
+      // All-mode values are constraints; an OR between them follows the same
+      // same-field-positive chain rules as directive chains.
+      pushConstraint(allMode, text, negated, chained)
       return
+    }
+    if (chained && !lastWasTerm && lastConstraint !== undefined) {
+      // A term joined by OR to a preceding directive is Boolean structure the
+      // flat model cannot represent — pass the expression through verbatim.
+      verbatim = true
     }
     const term: QueryTerm = { text }
     if (phrase) term.phrase = true
@@ -323,16 +404,22 @@ export function parseSearchQuery(raw: string): StructuredQuery {
     }
     orPending = false
     lastWasTerm = true
+    openGroup = undefined
     query.terms.push(term)
   }
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index] as RawToken
     if (token.quoted) {
-      pushTerm(token.text, true)
+      pushTerm(token.text, true, orPending)
       continue
     }
-    if (token.text === '(' || token.text === ')') continue
+    if (token.text === '(' || token.text === ')') {
+      // Parentheses change operator precedence in ways the flat constraint
+      // model cannot represent — pass the raw expression through unchanged.
+      verbatim = true
+      continue
+    }
     if (token.text === 'OR' || token.text === '|' || token.text === '||') {
       orPending = true
       query.hasDirectives = true
@@ -357,6 +444,10 @@ export function parseSearchQuery(raw: string): StructuredQuery {
     const allMatch = name === undefined ? undefined : ALL_MODES[name]
     const field = name === undefined ? undefined : DIRECTIVE_FIELDS[name]
     if (match !== null && allMatch !== undefined) {
+      if (orPending) {
+        // An OR pointing at an all-mode directive has no flat representation.
+        verbatim = true
+      }
       allMode = allMatch
       query.hasDirectives = true
       const inline = (match[3] as string).trim()
@@ -366,6 +457,7 @@ export function parseSearchQuery(raw: string): StructuredQuery {
       continue
     }
     if (match !== null && field !== undefined) {
+      const chained = orPending
       let value = (match[3] as string).trim()
       if (value.length === 0) {
         const next = tokens[index + 1]
@@ -381,6 +473,11 @@ export function parseSearchQuery(raw: string): StructuredQuery {
       const negated = match[1] === '-' || negateNext
       negateNext = false
       if (field === 'before' || field === 'after') {
+        if (chained) {
+          // An OR chain over date bounds has no conjunctive representation.
+          verbatim = true
+          continue
+        }
         const date = parseDateValue(value)
         if (date === undefined) {
           pushTerm(token.text, false)
@@ -391,13 +488,21 @@ export function parseSearchQuery(raw: string): StructuredQuery {
         query.hasDirectives = true
         orPending = false
         lastWasTerm = false
+        openGroup = undefined
+        lastConstraint = undefined
       } else if (field === 'lang') {
+        if (chained) {
+          verbatim = true
+          continue
+        }
         query.lang = value.toLowerCase()
         query.hasDirectives = true
         orPending = false
         lastWasTerm = false
+        openGroup = undefined
+        lastConstraint = undefined
       } else {
-        pushConstraint(field, value, negated)
+        pushConstraint(field, value, negated, chained)
       }
       continue
     }
@@ -414,25 +519,46 @@ export function parseSearchQuery(raw: string): StructuredQuery {
       if (negativeMatch !== null && negativeField !== undefined
         && negativeField !== 'before' && negativeField !== 'after' && negativeField !== 'lang') {
         negateNext = false
-        pushConstraint(negativeField, (negativeMatch[3] as string).trim(), true)
+        pushConstraint(negativeField, (negativeMatch[3] as string).trim(), true, orPending)
         continue
       }
-      pushTerm(text, false)
+      pushTerm(text, false, orPending)
       continue
     }
     if (text.startsWith('+') && text.length > 1) {
-      pushTerm(text.slice(1), true)
+      pushTerm(text.slice(1), true, orPending)
       query.hasDirectives = true
       continue
     }
-    pushTerm(text, false)
+    pushTerm(text, false, orPending)
   }
 
   query.text = renderTerms(query.terms, { phrases: true, negation: true, or: true })
+  if (verbatim) {
+    // Boolean structure beyond same-field positive chains: hand the raw text
+    // to the engines unchanged and skip local constraint filtering entirely
+    // (canonical date bounds stay active — they are unambiguous conjunctions).
+    query.verbatim = true
+    query.sites = []
+    query.excludedSites = []
+    query.inUrl = []
+    query.excludedInUrl = []
+    query.inTitle = []
+    query.excludedInTitle = []
+    query.inText = []
+    query.excludedInText = []
+    query.filetypes = []
+    query.excludedFiletypes = []
+    query.orGroups = []
+    query.hasConstraints = query.before !== undefined || query.after !== undefined
+    return query
+  }
   query.hasConstraints = query.sites.length > 0 || query.excludedSites.length > 0
     || query.inUrl.length > 0 || query.excludedInUrl.length > 0
     || query.inTitle.length > 0 || query.excludedInTitle.length > 0
+    || query.inText.length > 0 || query.excludedInText.length > 0
     || query.filetypes.length > 0 || query.excludedFiletypes.length > 0
+    || query.orGroups.length > 0
     || query.before !== undefined || query.after !== undefined
   return query
 }
@@ -469,8 +595,17 @@ function quoteValue(value: string): string {
   return /\s/u.test(value) ? `"${value}"` : value
 }
 
+/** Canonical directive keyword per constraint field (stable rendering order). */
+const CONSTRAINT_DIRECTIVES: Record<ConstraintField, string> = {
+  site: 'site',
+  inUrl: 'inurl',
+  inTitle: 'intitle',
+  inText: 'intext',
+  filetype: 'filetype',
+}
 /** Format one parsed query for an engine's supported operator syntax. */
 export function formatQuery(query: StructuredQuery, syntax: QuerySyntax = {}): string {
+  if (query.verbatim) return query.raw.trim()
   const parts: string[] = []
   const text = renderTerms(query.terms, syntax)
   if (text.length > 0) parts.push(text)
@@ -499,6 +634,17 @@ export function formatQuery(query: StructuredQuery, syntax: QuerySyntax = {}): s
     }
     parts.push(...query.excludedFiletypes.map(type => `-filetype:${type}`))
   }
+  // Explicit same-field OR chains render as their canonical operator form.
+  // OR binds looser than the implicit AND, so a chain is parenthesized unless
+  // it stands alone. Engines without OR support receive the chain text
+  // verbatim — preserving the user's Boolean meaning beats silently AND-ing
+  // the values together.
+  const dateCount = syntax.dateRange && (query.after !== undefined || query.before !== undefined) ? 1 : 0
+  const standaloneGroup = parts.length === 0 && dateCount === 0 && query.orGroups.length === 1
+  for (const group of query.orGroups) {
+    const rendered = group.values.map(value => `${CONSTRAINT_DIRECTIVES[group.field]}:${quoteValue(value)}`).join(' OR ')
+    parts.push(standaloneGroup ? rendered : `(${rendered})`)
+  }
   if (syntax.dateRange) {
     if (query.after !== undefined) parts.push(`after:${query.after}`)
     if (query.before !== undefined) parts.push(`before:${query.before}`)
@@ -521,6 +667,7 @@ export function formatScraperQuery(
 ): string {
   const parsed = parsedQuery ?? parseSearchQuery(query)
   if (!parsed.hasDirectives) return query
+  if (parsed.verbatim) return query
   const demoted = [...parsed.sites.filter(site => site.includes('/')), ...parsed.inUrl]
   return formatQuery({
     ...parsed,
@@ -562,6 +709,8 @@ function sourceTime(source: WebSearchSource): number | undefined {
 
 interface ConstraintDimension {
   label: string
+  /** Negative dimensions (explicit exclusions) are never relaxed. */
+  negated: boolean
   predicate: (source: WebSearchSource) => boolean
 }
 
@@ -570,42 +719,68 @@ function constraintDimensions(query: StructuredQuery): ConstraintDimension[] {
   const lower = (value: string | undefined): string => value?.toLowerCase() ?? ''
   if (query.sites.length > 0) dimensions.push({
     label: query.sites.map(site => `site:${site}`).join(' OR '),
+    negated: false,
     predicate: source => query.sites.some(site => matchesSite(source.url, site)),
   })
   if (query.excludedSites.length > 0) dimensions.push({
     label: query.excludedSites.map(site => `-site:${site}`).join(' '),
+    negated: true,
     predicate: source => !query.excludedSites.some(site => matchesSite(source.url, site)),
   })
   if (query.inUrl.length > 0) dimensions.push({
     label: query.inUrl.map(value => `inurl:${value}`).join(' '),
+    negated: false,
     predicate: source => query.inUrl.every(value => lower(source.url).includes(value.toLowerCase())),
   })
   if (query.excludedInUrl.length > 0) dimensions.push({
     label: query.excludedInUrl.map(value => `-inurl:${value}`).join(' '),
+    negated: true,
     predicate: source => !query.excludedInUrl.some(value => lower(source.url).includes(value.toLowerCase())),
   })
   if (query.inTitle.length > 0) dimensions.push({
     label: query.inTitle.map(value => `intitle:${value}`).join(' '),
+    negated: false,
     predicate: source => query.inTitle.every(value => lower(source.title).includes(value.toLowerCase())),
   })
   if (query.excludedInTitle.length > 0) dimensions.push({
     label: query.excludedInTitle.map(value => `-intitle:${value}`).join(' '),
+    negated: true,
     predicate: source => !query.excludedInTitle.some(value => lower(source.title).includes(value.toLowerCase())),
   })
   if (query.filetypes.length > 0) dimensions.push({
     label: query.filetypes.map(type => `filetype:${type}`).join(' OR '),
+    negated: false,
     predicate: source => query.filetypes.some(type => matchesFiletype(source.url, type)),
   })
   if (query.excludedFiletypes.length > 0) dimensions.push({
     label: query.excludedFiletypes.map(type => `-filetype:${type}`).join(' '),
+    negated: true,
     predicate: source => !query.excludedFiletypes.some(type => matchesFiletype(source.url, type)),
   })
+  // Explicit same-field OR chains (positive directives only). `inText` groups
+  // stay engine-side: a merged source carries no observable body text.
+  for (const group of query.orGroups) {
+    if (group.field === 'inText') continue
+    const directive = CONSTRAINT_DIRECTIVES[group.field]
+    const values = group.values
+    dimensions.push({
+      label: values.map(value => `${directive}:${value}`).join(' OR '),
+      negated: false,
+      predicate: (source) => {
+        if (group.field === 'site') return values.some(site => matchesSite(source.url, site))
+        if (group.field === 'filetype') return values.some(type => matchesFiletype(source.url, type))
+        const haystack = group.field === 'inUrl' ? lower(source.url) : lower(source.title)
+        return values.some(value => haystack.includes(value.toLowerCase()))
+      },
+    })
+  }
   if (query.after !== undefined || query.before !== undefined) {
     const after = query.after === undefined ? undefined : Date.parse(query.after)
     const before = query.before === undefined ? undefined : Date.parse(query.before)
     dimensions.push({
       label: [query.after === undefined ? '' : `after:${query.after}`, query.before === undefined ? '' : `before:${query.before}`]
         .filter(Boolean).join(' '),
+      negated: false,
       predicate: (source) => {
         const time = sourceTime(source)
         if (time === undefined) return true
@@ -617,22 +792,47 @@ function constraintDimensions(query: StructuredQuery): ConstraintDimension[] {
   return dimensions
 }
 
+/** Options for {@link applyQueryConstraints}. */
+export interface ConstraintFilterOptions {
+  /**
+   * Allow a positive filter that would erase every remaining source to relax
+   * (reported in `dropped`) instead of returning an empty result. Explicit
+   * user intent is otherwise honored strictly: relaxation is opt-in.
+   * Negative filters (exclusions) are never relaxed either way.
+   */
+  readonly relaxPositive?: boolean
+}
+
 /**
- * Apply each observable constraint independently. A dimension that would erase
- * every remaining source is relaxed and reported instead of producing an empty
- * result from an otherwise successful search.
+ * Apply each observable constraint independently. Negative filters are always
+ * strict — an exclusion that matches every source is an empty answer, not a
+ * reason to ignore the user, and is reported via `emptiedBy`. Positive filters
+ * relax (with a report) only when `options.relaxPositive` is enabled; by
+ * default an over-constrained positive filter empties the result honestly.
+ * Verbatim (Boolean-structured) queries skip local filtering entirely.
  */
 export function applyQueryConstraints(
   sources: readonly WebSearchSource[],
   query: StructuredQuery,
+  options: ConstraintFilterOptions = {},
 ): ConstraintFilterResult {
   let current = [...sources]
   const dropped: string[] = []
   if (current.length === 0) return { sources: current, dropped }
-  for (const dimension of constraintDimensions(query)) {
+  if (query.verbatim) return { sources: current, dropped }
+  const dimensions = constraintDimensions(query)
+  for (const dimension of dimensions) {
+    if (!dimension.negated) continue
+    const kept = current.filter(dimension.predicate)
+    if (kept.length === 0) return { sources: [], dropped, emptiedBy: dimension.label }
+    current = kept
+  }
+  for (const dimension of dimensions) {
+    if (dimension.negated) continue
     const kept = current.filter(dimension.predicate)
     if (kept.length > 0) current = kept
-    else dropped.push(dimension.label)
+    else if (options.relaxPositive === true) dropped.push(dimension.label)
+    else return { sources: [], dropped, emptiedBy: dimension.label }
   }
   return { sources: current, dropped }
 }

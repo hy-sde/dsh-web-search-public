@@ -144,6 +144,19 @@ export interface PublicSearchProviderOptions {
    * Default: {@link DEFAULT_MAX_ENGINE_BACKOFF_MS}.
    */
   readonly maxEngineBackoffMs?: number
+  /**
+   * When a positive constraint would erase every remaining source, relax it
+   * (reported in the result's `notices`) instead of returning an empty result.
+   * Default: false — explicit intent is honored strictly. Negative filters
+   * (exclusions) are never relaxed either way.
+   */
+  readonly relaxPositiveConstraints?: boolean
+  /**
+   * Max in-flight engine operations per engine, shared across ALL concurrent
+   * searches; extra work queues for a slot, bounded by the aggregate hard
+   * deadline. Default: 1. 0 disables the limiter.
+   */
+  readonly maxConcurrentPerEngine?: number
 }
 
 /**
@@ -277,17 +290,33 @@ export function mergeSources(merged: Map<string, MergedSource>, sources: readonl
  * Resolve the full consensus list, then enforce observable query constraints.
  * The web seam remains the sole owner of `maxResults` truncation.
  */
-function toResult(merged: Map<string, MergedSource>, query: StructuredQuery): WebSearchResult {
+function toResult(
+  merged: Map<string, MergedSource>,
+  query: StructuredQuery,
+  options: { relaxPositive: boolean; engineOutcomes: readonly string[] },
+): WebSearchResult {
   const ranked = [...merged.values()]
     .sort((a, b) => b.engines - a.engines || a.bestRank - b.bestRank || a.order - b.order)
     .map(entry => entry.source)
-  const filtered = applyQueryConstraints(ranked, query)
+  const filtered = applyQueryConstraints(ranked, query, { relaxPositive: options.relaxPositive })
+  const notices: string[] = []
+  for (const label of filtered.dropped) {
+    notices.push(`no results matched \`${label}\`; the constraint was relaxed`)
+  }
+  if (filtered.emptiedBy !== undefined) {
+    notices.push(`every returned result was filtered out by \`${filtered.emptiedBy}\``)
+  }
+  if (filtered.sources.length === 0 && filtered.emptiedBy === undefined && options.engineOutcomes.length > 0) {
+    // Degraded coverage: at least one engine accepted the search but returned
+    // zero results while other engines failed or were skipped. Explain the
+    // emptiness instead of returning a bare `{ sources: [] }` that reads as a
+    // clean "no results" answer.
+    notices.push(`no engine returned results (${options.engineOutcomes.join('; ')})`)
+  }
   return {
     sources: filtered.sources,
     truncated: false,
-    ...filtered.dropped.length > 0
-      ? { notices: filtered.dropped.map(label => `no results matched \`${label}\`; the constraint was relaxed`) }
-      : {},
+    ...(notices.length > 0 ? { notices } : {}),
   }
 }
 
@@ -330,10 +359,16 @@ export class PublicSearchProvider implements WebSearchProvider {
   private readonly engineBackoffMs: number
   /** Resolved per-engine breaker cap (see {@link PublicSearchProviderOptions.maxEngineBackoffMs}). */
   private readonly maxEngineBackoffMs: number
+  /** Resolved relax-positive-constraints flag (see {@link PublicSearchProviderOptions.relaxPositiveConstraints}). */
+  private readonly relaxPositive: boolean
+  /** Resolved per-engine concurrency cap (see {@link PublicSearchProviderOptions.maxConcurrentPerEngine}). */
+  private readonly maxConcurrentPerEngine: number
   /** Epoch ms of the last all-engines-down failure; 0 = none yet. */
   private lastAllFailureAt = 0
   /** Aggregate message of that last failure, surfaced by fast-fails. */
   private lastAllFailureMessage = ''
+  /** Epoch ms of the last accepted engine response; cooldown recovery compares against it. */
+  private lastSuccessAt = 0
   /** Per-engine circuit-breaker state, keyed by engine id. */
   private readonly health = new Map<PublicEngineId, EngineHealth>()
   /** Aborted when the provider is disposed; composed into every search signal. */
@@ -350,6 +385,12 @@ export class PublicSearchProvider implements WebSearchProvider {
    * navigations, transport timers) running.
    */
   private readonly inflight = new Set<Promise<unknown>>()
+  /**
+   * Per-engine concurrency slots shared across ALL concurrent searches: the
+   * active count plus queued waiters (see
+   * {@link PublicSearchProviderOptions.maxConcurrentPerEngine}).
+   */
+  private readonly engineSlots = new Map<PublicEngineId, { active: number; waiters: (() => void)[] }>()
   private disposed = false
 
   constructor(private readonly options: PublicSearchProviderOptions) {
@@ -358,6 +399,8 @@ export class PublicSearchProvider implements WebSearchProvider {
     this.failureCooldownMs = options.failureCooldownMs ?? DEFAULT_FAILURE_COOLDOWN_MS
     this.engineBackoffMs = options.engineBackoffMs ?? DEFAULT_ENGINE_BACKOFF_MS
     this.maxEngineBackoffMs = options.maxEngineBackoffMs ?? DEFAULT_MAX_ENGINE_BACKOFF_MS
+    this.relaxPositive = options.relaxPositiveConstraints ?? false
+    this.maxConcurrentPerEngine = options.maxConcurrentPerEngine ?? 1
   }
 
   /** Credential-free: usable whenever at least one engine is configured. */
@@ -401,8 +444,11 @@ export class PublicSearchProvider implements WebSearchProvider {
     }
     // Fast-fail during the cooldown window after an all-engines-down failure:
     // re-blasting engines that just throttled us deepens the block, so surface
-    // a clear "try again shortly" error instead of burning requests.
-    if (this.failureCooldownMs > 0 && this.lastAllFailureAt > 0) {
+    // a clear "try again shortly" error instead of burning requests. The
+    // failure only counts while it is more recent than the last accepted
+    // engine response — a concurrent search that reached an engine clears the
+    // aggregate cooldown (per-engine breakers still apply).
+    if (this.failureCooldownMs > 0 && this.lastAllFailureAt > this.lastSuccessAt) {
       const elapsed = Date.now() - this.lastAllFailureAt
       if (elapsed < this.failureCooldownMs) {
         const seconds = Math.ceil((this.failureCooldownMs - elapsed) / 1000)
@@ -517,50 +563,63 @@ export class PublicSearchProvider implements WebSearchProvider {
           skipped.push(`${engine.id}: skipped (recent failures: ${tripped.reason})`)
           return
         }
-        const attempt = await this.attempt(engine, request, raceSignal)
-        if (attempt.kind === 'ok' && attempt.sources.length > 0) {
-          responses[index] = attempt.sources
-          okCount += 1
-          this.recordSuccess(engine.id)
-          resolveFirstSuccess()
-        } else if (attempt.kind === 'ok') {
-          // Accepted empty page: a legitimate zero-result answer. Not a
-          // failure — a single obscure query must not penalize an engine;
-          // structured challenge detection (status + block classifiers) is
-          // the block signal now.
-          okCount += 1
-          this.recordSuccess(engine.id)
-        } else if (attempt.kind === 'timedOut') {
-          failures.push(`${engine.id}: timed out after ${this.options.timeoutMs}ms`)
+        // Concurrency slot BEFORE the engine operation: queued work neither
+        // contacts the engine nor consumes its per-engine timeout.
+        const slot = await this.acquireEngineSlot(engine.id, raceSignal, deadlineAt)
+        if (slot === 'timedOut') {
+          failures.push(`${engine.id}: queued for a concurrency slot past the hard deadline`)
           softFailed.push(engine.id)
-        } else if (attempt.kind === 'challenge') {
-          failures.push(`${engine.id}: ${attempt.message}`)
-          hardFailed.push(engine.id)
-          this.recordTrip(engine.id, attempt.message, tripCounter)
-        } else if (attempt.kind === 'http') {
-          failures.push(`${engine.id}: ${attempt.message}`)
-          if (attempt.status === undefined || attempt.status >= 500) {
-            softFailed.push(engine.id)
-          } else {
-            hardFailed.push(engine.id)
-            this.recordTrip(engine.id, attempt.message, tripCounter)
-          }
-        } else if (attempt.kind === 'transport' || attempt.kind === 'invalidResponse') {
-          failures.push(`${engine.id}: ${attempt.message}`)
-          softFailed.push(engine.id)
-        } else if (attempt.kind === 'failed') {
-          // Legacy/unknown rejection: classify by message so third-party
-          // engines keep the old signatures working.
-          if (attempt.message === 'aborted by caller') return
-          failures.push(`${engine.id}: ${attempt.message}`)
-          if (isHardBlock(attempt.message)) {
-            hardFailed.push(engine.id)
-            this.recordTrip(engine.id, attempt.message, tripCounter)
-          } else if (isSoftTransport(attempt.message)) {
-            softFailed.push(engine.id)
-          }
+          return
         }
-        // kind === 'canceled': a caller/aggregate abort — not an engine failure.
+        if (slot === 'canceled') return
+        try {
+          const attempt = await this.attempt(engine, request, raceSignal)
+          if (attempt.kind === 'ok' && attempt.sources.length > 0) {
+            responses[index] = attempt.sources
+            okCount += 1
+            this.recordSuccess(engine.id)
+            resolveFirstSuccess()
+          } else if (attempt.kind === 'ok') {
+            // Accepted empty page: a legitimate zero-result answer. Not a
+            // failure — a single obscure query must not penalize an engine;
+            // structured challenge detection (status + block classifiers) is
+            // the block signal now.
+            okCount += 1
+            this.recordSuccess(engine.id)
+          } else if (attempt.kind === 'timedOut') {
+            failures.push(`${engine.id}: timed out after ${this.options.timeoutMs}ms`)
+            softFailed.push(engine.id)
+          } else if (attempt.kind === 'challenge') {
+            failures.push(`${engine.id}: ${attempt.message}`)
+            hardFailed.push(engine.id)
+            this.recordTrip(engine.id, attempt.message, tripCounter)
+          } else if (attempt.kind === 'http') {
+            failures.push(`${engine.id}: ${attempt.message}`)
+            if (attempt.status === undefined || attempt.status >= 500) {
+              softFailed.push(engine.id)
+            } else {
+              hardFailed.push(engine.id)
+              this.recordTrip(engine.id, attempt.message, tripCounter)
+            }
+          } else if (attempt.kind === 'transport' || attempt.kind === 'invalidResponse') {
+            failures.push(`${engine.id}: ${attempt.message}`)
+            softFailed.push(engine.id)
+          } else if (attempt.kind === 'failed') {
+            // Legacy/unknown rejection: classify by message so third-party
+            // engines keep the old signatures working.
+            if (attempt.message === 'aborted by caller') return
+            failures.push(`${engine.id}: ${attempt.message}`)
+            if (isHardBlock(attempt.message)) {
+              hardFailed.push(engine.id)
+              this.recordTrip(engine.id, attempt.message, tripCounter)
+            } else if (isSoftTransport(attempt.message)) {
+              softFailed.push(engine.id)
+            }
+          }
+          // kind === 'canceled': a caller/aggregate abort — not an engine failure.
+        } finally {
+          this.releaseEngineSlot(engine.id)
+        }
       } finally {
         settled[index] = true
       }
@@ -617,7 +676,8 @@ export class PublicSearchProvider implements WebSearchProvider {
       })
       throw new AllFailedError(failures, skipped, hardFailed, softFailed, tripCounter.count)
     }
-    return toResult(merged, request.parsedQuery)
+    const engineOutcomes = merged.size === 0 ? [...failures, ...skipped] : []
+    return toResult(merged, request.parsedQuery, { relaxPositive: this.relaxPositive, engineOutcomes })
   }
 
   /** Whether an engine's circuit breaker is open right now. */
@@ -646,8 +706,14 @@ export class PublicSearchProvider implements WebSearchProvider {
     return true
   }
 
-  /** An accepted search (results or an accepted empty page) resets the backoff window. */
+  /**
+   * An accepted search (results or an accepted empty page) resets the backoff
+   * window AND the aggregate cooldown: the most recent accepted response wins
+   * over an older all-failed record, so a concurrent success lets the next
+   * search through instead of fast-failing for the whole cooldown window.
+   */
   private recordSuccess(id: PublicEngineId): void {
+    this.lastSuccessAt = Date.now()
     const h = this.healthOf(id)
     if (h.brokenUntil > 0) {
       h.brokenUntil = 0
@@ -664,6 +730,85 @@ export class PublicSearchProvider implements WebSearchProvider {
     return h
   }
 
+  private slotOf(id: PublicEngineId): { active: number; waiters: (() => void)[] } {
+    let slots = this.engineSlots.get(id)
+    if (slots === undefined) {
+      slots = { active: 0, waiters: [] }
+      this.engineSlots.set(id, slots)
+    }
+    return slots
+  }
+
+  /**
+   * Acquire one of `maxConcurrentPerEngine` in-flight slots for an engine,
+   * shared across ALL concurrent searches. Under the limit this resolves
+   * immediately; otherwise the caller queues and races the handoff against the
+   * shared race signal (an aborted or finished search leaves without a slot)
+   * and the aggregate hard deadline (denied like any other timeout — no
+   * network request is made). Losing the race removes the queue entry, so a
+   * later handoff can never be consumed by a caller that already gave up.
+   */
+  private acquireEngineSlot(
+    id: PublicEngineId,
+    signal: AbortSignal,
+    deadlineAt: number,
+  ): Promise<'acquired' | 'canceled' | 'timedOut'> {
+    if (this.maxConcurrentPerEngine <= 0) return Promise.resolve('acquired')
+    const slots = this.slotOf(id)
+    if (slots.active < this.maxConcurrentPerEngine) {
+      slots.active += 1
+      return Promise.resolve('acquired')
+    }
+    return new Promise((resolve) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const finish = (outcome: 'acquired' | 'canceled' | 'timedOut'): void => {
+        if (settled) return
+        settled = true
+        const at = slots.waiters.indexOf(entry)
+        if (at >= 0) slots.waiters.splice(at, 1)
+        if (timer !== undefined) clearTimeout(timer)
+        signal.removeEventListener('abort', onAbort)
+        resolve(outcome)
+      }
+      const entry = (): void => {
+        // A handoff must fund a full per-engine attempt out of the caller's
+        // remaining aggregate budget; a queue wait that consumed the budget is
+        // denied like any other timeout, and the slot is recycled for the next
+        // waiter (or released) instead of funding a doomed attempt that
+        // contacts the engine anyway.
+        if (Date.now() + this.options.timeoutMs > deadlineAt) {
+          finish('timedOut')
+          this.releaseEngineSlot(id)
+          return
+        }
+        finish('acquired')
+      }
+      const onAbort = (): void => finish('canceled')
+      slots.waiters.push(entry)
+      if (signal.aborted) {
+        finish('canceled')
+        return
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      timer = setTimeout(() => finish('timedOut'), Math.max(0, deadlineAt - Date.now()))
+    })
+  }
+
+  /** Release an engine slot, handing it to the next queued waiter if any. */
+  private releaseEngineSlot(id: PublicEngineId): void {
+    const slots = this.engineSlots.get(id)
+    if (slots === undefined) return
+    const next = slots.waiters.shift()
+    if (next !== undefined) {
+      // Handoff: the active count stays at the limit; the waiter now owns the
+      // slot and its fan-out callback releases it when the attempt settles.
+      next()
+      return
+    }
+    slots.active -= 1
+    if (slots.active <= 0 && slots.waiters.length === 0) this.engineSlots.delete(id)
+  }
   /**
    * Run one engine with a per-engine transport deadline.
    *

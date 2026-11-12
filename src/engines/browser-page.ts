@@ -59,22 +59,27 @@ export interface LoadedHtmlPage {
 }
 
 /**
- * One page load in a real browser: navigates (optionally seeding a home URL
- * first for cookies), optionally waits for a ready selector, and returns the
- * rendered HTML plus the navigation response status and final URL. The host
- * implementation is `BrowserService.fetchPageHtml` — structurally duck-typed
- * here so this package needs no import of the browser service types.
+ * Options for a rendered-HTML page fetch: optional home-page seeding for
+ * cookies, an optional ready selector, a per-navigation timeout, an abort
+ * signal, and an ALTCHA-interstitial handler.
+ */
+export interface PageScraperOptions {
+  homeUrl?: string
+  ready?: { selector: string; timeoutMs: number }
+  timeoutMs?: number
+  signal?: AbortSignal
+  /** Mojeek-style ALTCHA interstitial: click its checkbox, wait for the PoW redirect to show results. */
+  altcha?: { resultsSelector: string; waitMs: number }
+}
+
+/**
+ * Fetch a page's rendered HTML through a real browser. The options/return
+ * shapes are structurally matched against the host browser service at compile
+ * time in `src/host-browser-compat.ts`.
  */
 export type PageScraper = (
   url: string,
-  options: {
-    homeUrl?: string
-    ready?: { selector: string; timeoutMs: number }
-    timeoutMs?: number
-    signal?: AbortSignal
-    /** Mojeek-style ALTCHA interstitial: click the widget checkbox, wait for PoW redirect. */
-    altcha?: { resultsSelector: string; waitMs: number }
-  },
+  options: PageScraperOptions,
 ) => Promise<LoadedHtmlPage>
 
 /**
