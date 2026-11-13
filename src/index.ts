@@ -14,9 +14,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { } from '@deepseek-ai/dsh-web'
 import { createEngines } from './engines/index.ts'
-import { BrowserUnavailableError, type PageScraper } from './engines/browser-page.ts'
-// Compile-time host-browser compatibility assertion (see src/host-browser-compat.ts).
-import './host-browser-compat.ts'
+import {
+  BrowserUnavailableError,
+  type LoadedHtmlPage,
+  type PageScraper,
+  type PageScraperOptions,
+} from './engines/browser-page.ts'
 import {
   DEFAULT_ENGINE_BACKOFF_MS,
   DEFAULT_FAILURE_COOLDOWN_MS,
@@ -27,7 +30,7 @@ import {
   PublicSearchProvider,
   SOFT_DEADLINE_MS,
 } from './provider.ts'
-import type { PublicEngineId } from './types.ts'
+import { EngineSearchFailure, type PublicEngineId } from './types.ts'
 import {
   DEFAULT_ENGINE_ORDER,
   DEFAULT_ENGINE_TIMEOUT_MS,
@@ -150,29 +153,50 @@ function assertNonNegativeInteger(name: string, value: number): void {
   }
 }
 
+/** Whether a value exposes the optional host browser scraper method. */
+function hasPageScraper(value: unknown): value is {
+  fetchPageHtml(url: string, options: PageScraperOptions): Promise<unknown>
+} {
+  return typeof value === 'object'
+    && value !== null
+    && 'fetchPageHtml' in value
+    && typeof value.fetchPageHtml === 'function'
+}
+
+/** Validate the actual host response before an engine trusts it as rendered HTML. */
+function isLoadedHtmlPage(value: unknown): value is LoadedHtmlPage {
+  return typeof value === 'object'
+    && value !== null
+    && 'html' in value
+    && typeof value.html === 'string'
+    && 'status' in value
+    && typeof value.status === 'number'
+    && 'url' in value
+    && typeof value.url === 'string'
+}
+
 /**
- * Browser escalation resolves the host `browser` service LAZILY — at the first
- * challenged fetch, not at `apply` time — so mount order never matters and a
- * browser row mounted later still works. When the service is missing at
- * escalation time the scraper throws {@link BrowserUnavailableError}, which
- * `browserFetch` translates into the structured failure the escalation trigger
- * warrants (a challenge stays a challenge and trips the breaker honestly; a
- * transport failure keeps its retryable classification) instead of silently
- * staying fetch-only.
- * Compatibility with the host `BrowserService.fetchPageHtml` signature is
- * asserted at compile time in `src/host-browser-compat.ts`.
+ * Browser escalation resolves and validates the live host service lazily. A
+ * missing service remains an expected optional-capability failure; a method or
+ * response mismatch is an invalid engine response instead of unchecked data.
  */
 function resolveBrowserScraper(ctx: Context): PageScraper {
-  return (url, options) => {
+  return async (url, options) => {
     let browser: unknown
     try {
       browser = ctx.get('browser')
     } catch {
       throw new BrowserUnavailableError()
     }
-    const service = browser as { fetchPageHtml?: PageScraper } | null | undefined
-    if (typeof service?.fetchPageHtml !== 'function') throw new BrowserUnavailableError()
-    return service.fetchPageHtml(url, options)
+    if (!hasPageScraper(browser)) throw new BrowserUnavailableError()
+    const page = await browser.fetchPageHtml(url, options)
+    if (!isLoadedHtmlPage(page)) {
+      throw new EngineSearchFailure(
+        'invalidResponse',
+        'browser escalation returned an invalid page; expected string html/url and numeric status',
+      )
+    }
+    return page
   }
 }
 

@@ -93,6 +93,31 @@ export const MOJEEK_QUERY_SYNTAX: QuerySyntax = {
   site: true,
 }
 
+/**
+ * Return strict constraints an engine cannot enforce and the merged result
+ * cannot verify from URL/title metadata.
+ */
+export function unsupportedQueryConstraints(
+  query: StructuredQuery,
+  syntax: QuerySyntax | undefined,
+): string[] {
+  if (syntax === undefined || query.verbatim) return []
+  const unsupported: string[] = []
+  if (!syntax.inText && (query.inText.length > 0 || query.excludedInText.length > 0)) {
+    unsupported.push([
+      ...query.inText.map(value => `intext:${quoteValue(value)}`),
+      ...query.excludedInText.map(value => `-intext:${quoteValue(value)}`),
+    ].join(' '))
+  }
+  if (!syntax.dateRange && (query.after !== undefined || query.before !== undefined)) {
+    unsupported.push([
+      query.after === undefined ? '' : `after:${query.after}`,
+      query.before === undefined ? '' : `before:${query.before}`,
+    ].filter(Boolean).join(' '))
+  }
+  return unsupported
+}
+
 /** Engine request; direct engine callers may omit the shared canonical parse. */
 export interface PublicSearchRequest extends WebSearchRequest {
   readonly parsedQuery?: StructuredQuery

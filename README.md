@@ -150,23 +150,23 @@ fetch provider and `tool-web` row.
   it to the request's `maxResults` and sets `truncated` itself.
 - Queries are parsed once before retries. Classic operators — quoted phrases, negation, `OR`,
   `site:`, `inurl:`, `intitle:`, `intext:`, `filetype:`, `after:`/`before:`, and
-  `lang:` aliases — are canonicalized for each engine's supported syntax; recognized BCP 47
+  `lang:` aliases — are canonicalized for each engine's supported syntax. Recognized BCP 47
   `lang:` values map to DuckDuckGo's `kl` locale codes. Boolean structure is preserved rather
   than rewritten: `OR` chains between same-field directives (`intitle:guide OR intitle:manual`)
-  stay disjunctions in both the per-engine query strings and the local filter, and any
-  unsupported Boolean combination (parenthesized groups, mixed term/directive chains) is
-  passed through verbatim — the engines enforce it and the local constraint filter stands
-  down instead of guessing at meaning. Observable site, URL, title, filetype, and
-  publication-date constraints are applied to the consensus-merged sources. Explicit negative
-  filters (`-site:…`) are never relaxed: when every result is excluded, the call returns `[]`
-  with a notice naming the filter. Positive constraints are strict by default as well
-  (`relaxPositiveConstraints: false`); opting in restores the older behavior where a dimension
-  that would erase every result is relaxed and returned as a notice.
-- `recency: day|week|month|year` maps to Startpage `with_date`, DuckDuckGo `df`, Google
-  `tbs`, and Mojeek `since`. Ecosia has no reliable independent recency parameter and ignores
-  the field rather than switching topic or ranking mode.
-- Each engine still runs under its own `AbortSignal.timeout(timeoutMs)` race, so an engine
-  that ignores the aggregate’s cancellation dies at its own cap.
+  stay disjunctions in both the per-engine query strings and the local filter, and unsupported
+  Boolean combinations are passed through verbatim. Observable site, URL, title, filetype,
+  and publication-date constraints are applied to merged sources. An engine is skipped when
+  it cannot enforce a body-text or absolute-date constraint that result metadata cannot
+  verify; the result notice names that coverage loss. Negative filters are never relaxed.
+  Positive constraints are strict by default; `relaxPositiveConstraints: true` permits a
+  positive dimension that would erase every result to be relaxed with a notice.
+- A seam caller may pass `recency: day|week|month|year`; this maps to Startpage `with_date`,
+  DuckDuckGo `df`, Google `tbs`, and Mojeek `since`. Ecosia ignores recency rather than
+  changing topic or ranking mode. The published `dsh-tool-web@0.2.2-rc.1` does not expose a
+  model-facing recency parameter; use `after:`/`before:` operators on that release.
+- Each admitted engine attempt uses the smaller of `timeoutMs` and its remaining aggregate
+  budget. A concurrency slot remains occupied until the raw engine operation settles, even
+  when its timeout facade has already returned.
 - **Rate-limit resilience is best-effort, layered, and verdict-driven.** Engine outcomes are
   classified — accepted page with results, explicit no-results page, challenge wall, HTTP
   status, invalid response, transport failure, timeout, or cancellation. A challenge wall,
@@ -183,13 +183,10 @@ fetch provider and `tool-web` row.
 - A caller abort (`signal.aborted`) aborts the fan-out and throws `WEB_ABORTED`; an aborted
   fetch never escalates to the browser.
 - Only if **no engine produced an accepted page** does the provider throw `WEB_PROVIDER_ERROR`
-  with each engine’s reason (`id: <reason>; …`) — engines that were still running at the hard
-  deadline are listed as `did not settle before the hard deadline`. If at least one engine
-  accepted the search and found nothing, the call succeeds with `[]` (`truncated: false`);
-  when other engines failed or were skipped in the same fan-out, the result carries a
-  model-visible notice explaining the degraded coverage, e.g.
-  `no engine returned results (startpage: no results; ecosia: challenge wall)` — so the
-  distinction between a genuine empty answer and a blocked fan-out stays visible.
+  with each engine’s reason (`id: <reason>; …`). A successful partial fan-out returns its
+  sources plus a structured notice naming failed, skipped, or unavailable engines. Empty
+  partial results use `no engine returned results (…)`; nonempty partial results use
+  `search coverage was degraded (…)`.
 
 The worst case for the default configuration is ≈ `hardDeadlineMs` (30 s) overall — the
 deadline is the whole budget for the search including retries and their backoff — well under
@@ -205,11 +202,10 @@ Browser behavior and hardening are owned by the mounted browser provider. The ci
 opens only when every available transport is blocked.
 
 Escalation resolves the `browser` service lazily at the first challenged fetch, so mount order
-never matters — a browser row mounted later still lights the browser-backed engines up. When
-no browser service is mounted at escalation time, a challenge trigger is classified as a
-challenge (and trips that engine's breaker honestly) while a transport trigger keeps its
-retryable classification. `timeoutMs` (default 30 s) is the per-engine budget that covers
-fetch → browser steps.
+never matters. The plugin validates the live `fetchPageHtml` method and its `html`, `status`,
+and `url` response fields before parsing. A missing browser keeps the original challenge or
+transport classification; an incompatible response is an `invalidResponse` engine failure.
+`timeoutMs` (default 30 s) is the per-engine budget covering fetch and browser steps.
 
 ## Configuration
 
@@ -273,11 +269,11 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
   cookies retained by the mounted browser service's scraper context.
 - **Treat queries as public.** Each query is sent to several public search engines. Do not
   search for secrets or PII you would not paste into a public search box.
-- **Amplification is bounded but real.** Every search contacts every configured engine, and
-  overlapping searches share each engine's `maxConcurrentPerEngine` slot budget (default one
-  in-flight operation per engine) rather than multiplying load without limit.
-  Startpage alone uses a homepage GET plus a search POST; browser escalation may add home-page
-  navigation, redirects, and subresource requests. See [docs/operations.md](docs/operations.md).
+- **Amplification is bounded but real.** Every search contacts each compatible configured
+  engine. Overlapping searches share each engine's `maxConcurrentPerEngine` slot budget
+  (default one raw operation per engine); a timed-out operation retains its slot until its
+  cleanup settles. Startpage alone uses a homepage GET plus a search POST; browser escalation
+  may add navigation, redirects, and subresource requests. See [docs/operations.md](docs/operations.md).
 - **Responses are bounded.** Plain-fetch HTML is limited to 2 MiB before parsing; browser
   escalation rejects rendered HTML above 2 Mi characters.
 - **No fetch provider of our own.** This bundle mounts no fetch provider and changes no
@@ -295,10 +291,11 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
 | DeepSeek Harness | `0.2.2-rc.1` (`@deepseek-ai/dsh-web ^0.2.2-rc.1`, `@deepseek-ai/cordis ~4.1.0`) |
 | Seam | `ctx.web` `WebSearchProvider` (no API key, no fetch provider) |
 
-The provider implements only the `WebSearchProvider` seam contract; the model-facing tool is
-`@deepseek-ai/dsh-tool-web`, which this package does not ship. DeepSeek Harness is a
-developer preview. Upstream seam-contract changes require a new package release and contract
-review.
+The provider implements only `WebSearchProvider`; `@deepseek-ai/dsh-tool-web` owns the
+model-facing tool. The published `dsh-tool-web@0.2.2-rc.1` forwards query and result count but
+does not forward `recency` or render `WebSearchResult.notices`. Programmatic `ctx.web` callers
+still receive both fields. Harness builds whose tool supports these fields expose them to the
+model without a plugin change.
 
 ## Development
 

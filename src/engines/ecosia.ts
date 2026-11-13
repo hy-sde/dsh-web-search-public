@@ -9,7 +9,7 @@
 import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { PublicEngine, PublicEngineId } from '../types.ts'
 import { EngineSearchFailure } from '../types.ts'
-import { formatScraperQuery, type PublicSearchRequest } from '../query.ts'
+import { formatScraperQuery, GOOGLE_QUERY_SYNTAX, type PublicSearchRequest } from '../query.ts'
 import { browserFetch, type LoadedHtmlPage, type PageScraper } from './browser-page.ts'
 import { challengePageInput, classifyChallengeResponse, describeChallenge, type ChallengeVerdict } from './challenge.ts'
 import { acceptSearchPage, anchors, dedupeSources, elementText, elementsByClass, isUsableUrl, stripNoise } from './html.ts'
@@ -41,6 +41,7 @@ export function isBlockedPage(page: LoadedHtmlPage): boolean {
 
 export class EcosiaEngine implements PublicEngine {
   readonly id: PublicEngineId = 'ecosia'
+  readonly querySyntax = GOOGLE_QUERY_SYNTAX
 
   constructor(private readonly userAgent: string, private readonly scraper?: PageScraper) { }
 

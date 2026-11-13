@@ -5,7 +5,9 @@ import {
   formatQuery,
   formatScraperQuery,
   GOOGLE_QUERY_SYNTAX,
+  MOJEEK_QUERY_SYNTAX,
   parseSearchQuery,
+  unsupportedQueryConstraints,
 } from '../src/query.ts'
 
 describe('public search query controls', () => {
@@ -27,6 +29,19 @@ describe('public search query controls', () => {
 
     expect(parsed.before).toBeUndefined()
     expect(parsed.text).toBe(raw)
+  })
+
+  it('identifies constraints an engine cannot enforce from result metadata', () => {
+    const parsed = parseSearchQuery('agent -intext:deprecated after:2026-01-01')
+
+    expect(unsupportedQueryConstraints(parsed, MOJEEK_QUERY_SYNTAX)).toEqual([
+      '-intext:deprecated',
+      'after:2026-01-01',
+    ])
+    expect(unsupportedQueryConstraints(parsed, DUCKDUCKGO_QUERY_SYNTAX)).toEqual([
+      'after:2026-01-01',
+    ])
+    expect(unsupportedQueryConstraints(parsed, GOOGLE_QUERY_SYNTAX)).toEqual([])
   })
 
   it('filters observable dimensions after merge without treating undated sources as stale', () => {

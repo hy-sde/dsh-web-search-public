@@ -7,7 +7,7 @@
 
 import type { WebSearchSource } from '@deepseek-ai/dsh-web'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../types.ts'
-import { formatScraperQuery, type PublicSearchRequest } from '../query.ts'
+import { formatScraperQuery, GOOGLE_QUERY_SYNTAX, type PublicSearchRequest } from '../query.ts'
 import { challengePageInput, classifyChallengeResponse, describeChallenge } from './challenge.ts'
 import { acceptSearchPage, anchors, elementText, elementsByClass, isUsableUrl, scanTags, stripNoise } from './html.ts'
 import { fetchHtml, isOkStatus } from './http.ts'
@@ -19,6 +19,7 @@ const RECENCY_TO_WITH_DATE = { day: 'd', week: 'w', month: 'm', year: 'y' } as c
 
 export class StartpageEngine implements PublicEngine {
   readonly id: PublicEngineId = 'startpage'
+  readonly querySyntax = GOOGLE_QUERY_SYNTAX
 
   constructor(private readonly userAgent: string) {}
 

@@ -41,6 +41,7 @@ export function isRobotPage(page: LoadedHtmlPage): boolean {
 
 export class MojeekEngine implements PublicEngine {
   readonly id: PublicEngineId = 'mojeek'
+  readonly querySyntax = MOJEEK_QUERY_SYNTAX
 
   constructor(private readonly userAgent: string, private readonly scraper?: PageScraper) { }
 

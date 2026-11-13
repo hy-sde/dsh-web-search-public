@@ -73,9 +73,8 @@ export interface PageScraperOptions {
 }
 
 /**
- * Fetch a page's rendered HTML through a real browser. The options/return
- * shapes are structurally matched against the host browser service at compile
- * time in `src/host-browser-compat.ts`.
+ * Fetch a page's rendered HTML through a real browser. The plugin validates
+ * the mounted service method and returned fields at the call boundary.
  */
 export type PageScraper = (
   url: string,

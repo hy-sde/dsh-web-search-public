@@ -19,6 +19,11 @@ A note on the soft deadline: the aggregate deliberately waits for stragglers up 
 engine can hold the call to the soft window. Lower `softDeadlineMs` for lower latency at the
 cost of thinner consensus.
 
+`maxConcurrentPerEngine` counts raw engine operations. A timed-out facade aborts its
+operation but retains the slot until that operation settles, so signal-ignoring cleanup cannot
+overlap another request to the same engine. Queue time consumes the aggregate deadline; an
+admitted attempt uses only the remaining budget.
+
 ## Engine expectations (July-2026 baseline)
 
 | Engine | Typical live behavior | Failure mode |
@@ -52,9 +57,10 @@ change and record what you observed.
   HTML is rejected above 2 Mi characters.
 - Redirects: plain-fetch legs use `redirect: "error"`. Browser escalation follows redirects
   and may load subresources like a normal page.
-- Fan-out: all configured engines are contacted per query. Startpage makes two top-level
-  requests; browser escalation may add a home-page navigation, target navigation, redirects,
-  subresources, and a bounded Mojeek retry.
+- Fan-out: compatible configured engines are contacted per query. An engine that cannot
+  enforce an `intext:` or absolute-date constraint is skipped and named in the result notice.
+  Startpage makes two top-level requests; browser escalation may add home-page navigation,
+  target navigation, redirects, subresources, and a bounded Mojeek retry.
 - There is no IP pooling. Browser-engine cookies and storage may persist in the scraper
   context owned by the mounted browser service.
 
@@ -63,21 +69,23 @@ change and record what you observed.
 1. **No engine produced an accepted page** → the tool returns `WEB_PROVIDER_ERROR` with
    per-engine reasons: challenge, HTTP status, invalid or oversized response, timeout,
    transport error, or hard-deadline expiry.
-2. **One engine is flaky** → the fan-out absorbs it and opens its breaker when applicable.
-   When the survivors return nothing, the result explains why:
-   `no engine returned results (startpage: no results; ecosia: challenge wall)` appears as a
-   model-visible notice, so an empty page is never mistaken for a verified no-match answer.
+2. **One engine is flaky or incompatible with strict query operators** → the fan-out absorbs
+   it and returns a structured notice. Nonempty partial results report
+   `search coverage was degraded (…)`; empty partial results report
+   `no engine returned results (…)`.
 3. **A search legitimately has no matches** → only a page with an explicit no-results marker
    is accepted as `[]`; unknown HTTP-200 HTML remains a retryable engine failure.
 4. **Want a different engine set or order** → configure `engines`.
 5. **Want tighter latency or less amplification** → lower `softDeadlineMs`, shorten
-   `engines`, lower `maxConcurrentPerEngine`, or a combination.
-6. **Over-narrow query returns `[]` with a filter notice** → the constraint filter is strict:
-   positive dimensions erase all results instead of being relaxed unless
-   `relaxPositiveConstraints: true` is set, and negative filters (`-site:…`) are always
-   strict. Unsupported Boolean combinations (parentheses, mixed term/directive `OR` chains)
-   are forwarded to the engines verbatim rather than rewritten.
-7. **Want the DeepSeek route** → set `web.searchProvider: deepseek-official` and provide
+   `engines`, lower `maxConcurrentPerEngine`, or combine them.
+6. **Over-narrow query returns `[]` with a filter notice** → positive dimensions are strict
+   unless `relaxPositiveConstraints: true`; negative filters are always strict. Unsupported
+   Boolean combinations are forwarded verbatim. Engines that cannot enforce body-text or
+   absolute-date constraints are skipped rather than returning unverified matches.
+7. **Notices or recency are absent from a model tool call on Harness 0.2.2-rc.1** → that
+   published `dsh-tool-web` does not render notices or expose recency. Programmatic `ctx.web`
+   calls retain both; use `after:`/`before:` query operators for model calls on that release.
+8. **Want the DeepSeek route** → set `web.searchProvider: deepseek-official` and provide
    `DEEPSEEK_API_KEY`.
 
 ## Privacy hygiene

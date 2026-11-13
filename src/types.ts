@@ -5,7 +5,7 @@
  */
 
 import type { WebSearchSource } from '@deepseek-ai/dsh-web'
-import type { PublicSearchRequest } from './query.ts'
+import type { PublicSearchRequest, QuerySyntax } from './query.ts'
 
 /** The anonymous engines the provider fans out to. */
 export const PUBLIC_ENGINE_IDS = [
@@ -34,6 +34,8 @@ export const DEFAULT_ENGINE_TIMEOUT_MS = 30_000
 /** One credential-free search backend the provider fans out to. */
 export interface PublicEngine {
   readonly id: PublicEngineId
+  /** Query operators this engine enforces itself; omitted for third-party engines with an unknown capability set. */
+  readonly querySyntax?: QuerySyntax
   /**
    * Execute one search.
    * @throws {@link EngineSearchFailure} with a structured `kind` when the

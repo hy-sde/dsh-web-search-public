@@ -35,6 +35,7 @@ import type { PublicEngine, PublicEngineId } from './types.ts'
 import {
   applyQueryConstraints,
   normalizePublicSearchRequest,
+  unsupportedQueryConstraints,
   type NormalizedPublicSearchRequest,
   type StructuredQuery,
 } from './query.ts'
@@ -166,7 +167,7 @@ export interface PublicSearchProviderOptions {
  */
 type EngineAttempt =
   | { readonly kind: 'ok'; readonly sources: WebSearchSource[] }
-  | { readonly kind: 'timedOut' }
+  | { readonly kind: 'timedOut'; readonly timeoutMs: number }
   | { readonly kind: 'challenge'; readonly message: string }
   | { readonly kind: 'http'; readonly message: string; readonly status?: number }
   | { readonly kind: 'transport'; readonly message: string }
@@ -306,12 +307,11 @@ function toResult(
   if (filtered.emptiedBy !== undefined) {
     notices.push(`every returned result was filtered out by \`${filtered.emptiedBy}\``)
   }
-  if (filtered.sources.length === 0 && filtered.emptiedBy === undefined && options.engineOutcomes.length > 0) {
-    // Degraded coverage: at least one engine accepted the search but returned
-    // zero results while other engines failed or were skipped. Explain the
-    // emptiness instead of returning a bare `{ sources: [] }` that reads as a
-    // clean "no results" answer.
-    notices.push(`no engine returned results (${options.engineOutcomes.join('; ')})`)
+  if (options.engineOutcomes.length > 0) {
+    const detail = options.engineOutcomes.join('; ')
+    notices.push(filtered.sources.length === 0 && filtered.emptiedBy === undefined
+      ? `no engine returned results (${detail})`
+      : `search coverage was degraded (${detail})`)
   }
   return {
     sources: filtered.sources,
@@ -422,13 +422,13 @@ export class PublicSearchProvider implements WebSearchProvider {
   }
 
   /**
-   * Track a raw engine operation through its FINAL settlement, independently
-   * of the attempt facade's timeout result: `Effect.timeout` settles the
-   * attempt while the underlying promise may still be tearing down.
+   * Track a raw engine operation through its final settlement. The concurrency
+   * slot belongs to this raw operation, not to its timeout facade.
    */
-  private trackEngineOp(op: Promise<unknown>): void {
+  private trackEngineOp(op: Promise<unknown>, releaseSlot: () => void): void {
     const tracked = op.finally(() => {
       this.inflight.delete(tracked)
+      releaseSlot()
     })
     this.inflight.add(tracked)
     void tracked.catch(() => { })
@@ -558,68 +558,68 @@ export class PublicSearchProvider implements WebSearchProvider {
 
     const all = Promise.all(engines.map(async (engine, index) => {
       try {
+        const unsupported = unsupportedQueryConstraints(request.parsedQuery, engine.querySyntax)
+        if (unsupported.length > 0) {
+          failures.push(`${engine.id}: skipped (cannot enforce ${unsupported.join(', ')})`)
+          return
+        }
         const tripped = this.isTripped(engine.id)
         if (tripped.tripped) {
           skipped.push(`${engine.id}: skipped (recent failures: ${tripped.reason})`)
           return
         }
-        // Concurrency slot BEFORE the engine operation: queued work neither
-        // contacts the engine nor consumes its per-engine timeout.
+        // Acquire before starting transport work. Queue time consumes only the
+        // aggregate budget; the attempt clamps its own timeout to what remains.
         const slot = await this.acquireEngineSlot(engine.id, raceSignal, deadlineAt)
         if (slot === 'timedOut') {
           failures.push(`${engine.id}: queued for a concurrency slot past the hard deadline`)
-          softFailed.push(engine.id)
           return
         }
         if (slot === 'canceled') return
-        try {
-          const attempt = await this.attempt(engine, request, raceSignal)
-          if (attempt.kind === 'ok' && attempt.sources.length > 0) {
-            responses[index] = attempt.sources
-            okCount += 1
-            this.recordSuccess(engine.id)
-            resolveFirstSuccess()
-          } else if (attempt.kind === 'ok') {
-            // Accepted empty page: a legitimate zero-result answer. Not a
-            // failure — a single obscure query must not penalize an engine;
-            // structured challenge detection (status + block classifiers) is
-            // the block signal now.
-            okCount += 1
-            this.recordSuccess(engine.id)
-          } else if (attempt.kind === 'timedOut') {
-            failures.push(`${engine.id}: timed out after ${this.options.timeoutMs}ms`)
+        const attempt = await this.attempt(engine, request, raceSignal, deadlineAt)
+        if (attempt.kind === 'ok' && attempt.sources.length > 0) {
+          responses[index] = attempt.sources
+          okCount += 1
+          this.recordSuccess(engine.id)
+          resolveFirstSuccess()
+        } else if (attempt.kind === 'ok') {
+          // Accepted empty page: a legitimate zero-result answer. Not a
+          // failure — a single obscure query must not penalize an engine;
+          // structured challenge detection (status + block classifiers) is
+          // the block signal now.
+          okCount += 1
+          this.recordSuccess(engine.id)
+        } else if (attempt.kind === 'timedOut') {
+          failures.push(`${engine.id}: timed out after ${attempt.timeoutMs}ms`)
+          softFailed.push(engine.id)
+        } else if (attempt.kind === 'challenge') {
+          failures.push(`${engine.id}: ${attempt.message}`)
+          hardFailed.push(engine.id)
+          this.recordTrip(engine.id, attempt.message, tripCounter)
+        } else if (attempt.kind === 'http') {
+          failures.push(`${engine.id}: ${attempt.message}`)
+          if (attempt.status === undefined || attempt.status >= 500) {
             softFailed.push(engine.id)
-          } else if (attempt.kind === 'challenge') {
-            failures.push(`${engine.id}: ${attempt.message}`)
+          } else {
             hardFailed.push(engine.id)
             this.recordTrip(engine.id, attempt.message, tripCounter)
-          } else if (attempt.kind === 'http') {
-            failures.push(`${engine.id}: ${attempt.message}`)
-            if (attempt.status === undefined || attempt.status >= 500) {
-              softFailed.push(engine.id)
-            } else {
-              hardFailed.push(engine.id)
-              this.recordTrip(engine.id, attempt.message, tripCounter)
-            }
-          } else if (attempt.kind === 'transport' || attempt.kind === 'invalidResponse') {
-            failures.push(`${engine.id}: ${attempt.message}`)
-            softFailed.push(engine.id)
-          } else if (attempt.kind === 'failed') {
-            // Legacy/unknown rejection: classify by message so third-party
-            // engines keep the old signatures working.
-            if (attempt.message === 'aborted by caller') return
-            failures.push(`${engine.id}: ${attempt.message}`)
-            if (isHardBlock(attempt.message)) {
-              hardFailed.push(engine.id)
-              this.recordTrip(engine.id, attempt.message, tripCounter)
-            } else if (isSoftTransport(attempt.message)) {
-              softFailed.push(engine.id)
-            }
           }
-          // kind === 'canceled': a caller/aggregate abort — not an engine failure.
-        } finally {
-          this.releaseEngineSlot(engine.id)
+        } else if (attempt.kind === 'transport' || attempt.kind === 'invalidResponse') {
+          failures.push(`${engine.id}: ${attempt.message}`)
+          softFailed.push(engine.id)
+        } else if (attempt.kind === 'failed') {
+          // Legacy/unknown rejection: classify by message so third-party
+          // engines keep the old signatures working.
+          if (attempt.message === 'aborted by caller') return
+          failures.push(`${engine.id}: ${attempt.message}`)
+          if (isHardBlock(attempt.message)) {
+            hardFailed.push(engine.id)
+            this.recordTrip(engine.id, attempt.message, tripCounter)
+          } else if (isSoftTransport(attempt.message)) {
+            softFailed.push(engine.id)
+          }
         }
+        // kind === 'canceled': a caller/aggregate abort — not an engine failure.
       } finally {
         settled[index] = true
       }
@@ -676,7 +676,7 @@ export class PublicSearchProvider implements WebSearchProvider {
       })
       throw new AllFailedError(failures, skipped, hardFailed, softFailed, tripCounter.count)
     }
-    const engineOutcomes = merged.size === 0 ? [...failures, ...skipped] : []
+    const engineOutcomes = [...failures, ...skipped]
     return toResult(merged, request.parsedQuery, { relaxPositive: this.relaxPositive, engineOutcomes })
   }
 
@@ -740,13 +740,10 @@ export class PublicSearchProvider implements WebSearchProvider {
   }
 
   /**
-   * Acquire one of `maxConcurrentPerEngine` in-flight slots for an engine,
-   * shared across ALL concurrent searches. Under the limit this resolves
-   * immediately; otherwise the caller queues and races the handoff against the
-   * shared race signal (an aborted or finished search leaves without a slot)
-   * and the aggregate hard deadline (denied like any other timeout — no
-   * network request is made). Losing the race removes the queue entry, so a
-   * later handoff can never be consumed by a caller that already gave up.
+   * Acquire one of `maxConcurrentPerEngine` raw-operation slots, shared across
+   * all concurrent searches. Queue time consumes the aggregate budget but does
+   * not require a full per-engine timeout to remain; the attempt clamps that
+   * timeout after admission. Losing the race removes the queue entry.
    */
   private acquireEngineSlot(
     id: PublicEngineId,
@@ -772,12 +769,7 @@ export class PublicSearchProvider implements WebSearchProvider {
         resolve(outcome)
       }
       const entry = (): void => {
-        // A handoff must fund a full per-engine attempt out of the caller's
-        // remaining aggregate budget; a queue wait that consumed the budget is
-        // denied like any other timeout, and the slot is recycled for the next
-        // waiter (or released) instead of funding a doomed attempt that
-        // contacts the engine anyway.
-        if (Date.now() + this.options.timeoutMs > deadlineAt) {
+        if (Date.now() >= deadlineAt) {
           finish('timedOut')
           this.releaseEngineSlot(id)
           return
@@ -801,8 +793,8 @@ export class PublicSearchProvider implements WebSearchProvider {
     if (slots === undefined) return
     const next = slots.waiters.shift()
     if (next !== undefined) {
-      // Handoff: the active count stays at the limit; the waiter now owns the
-      // slot and its fan-out callback releases it when the attempt settles.
+      // Handoff: the active count stays at the limit until the admitted raw
+      // operation reaches final settlement.
       next()
       return
     }
@@ -831,11 +823,19 @@ export class PublicSearchProvider implements WebSearchProvider {
     engine: PublicEngine,
     request: NormalizedPublicSearchRequest,
     signal: AbortSignal | undefined,
+    deadlineAt: number,
   ): Promise<EngineAttempt> {
-    const timeoutMs = this.options.timeoutMs
+    const timeoutMs = Math.max(1, Math.min(this.options.timeoutMs, deadlineAt - Date.now()))
+    let rawStarted = false
+    let slotReleased = false
+    const releaseSlot = (): void => {
+      if (slotReleased) return
+      slotReleased = true
+      this.releaseEngineSlot(engine.id)
+    }
     // `Effect.gen(function*() { … })` is a plain generator function — its own
     // `this` is not the provider instance, so bind the tracker lexically.
-    const trackEngineOp = (op: Promise<unknown>): void => this.trackEngineOp(op)
+    const trackEngineOp = (op: Promise<unknown>): void => this.trackEngineOp(op, releaseSlot)
     const program = Effect.gen(function*() {
       if (signal?.aborted) return { kind: 'canceled' as const, message: 'aborted by caller' }
       const controller = new AbortController()
@@ -856,16 +856,13 @@ export class PublicSearchProvider implements WebSearchProvider {
             controller.abort()
           }),
       )
-      // The options form's `catch` maps to the ERROR channel and receives the
-      // original rejection (the bare function form wraps it in
-      // Cause.UnknownError, hiding the engine's message) — carry it through as
-      // a tagged error and recover it into a structured attempt kind here.
+      // The options form's `catch` maps to the error channel and receives the
+      // original rejection. Keep the raw promise tracked after the timeout
+      // facade settles so its slot cannot admit overlapping transport work.
       const outcome = yield* Effect.tryPromise({
         try: () => {
-          // Track the RAW operation, not the timeout facade: the facade
-          // settles when `Effect.timeout` expires while the underlying
-          // promise may still be performing async cleanup.
           const raw = engine.search(request, controller.signal)
+          rawStarted = true
           trackEngineOp(raw)
           return raw.then(
             sources => ({ kind: 'ok' as const, sources }),
@@ -889,11 +886,14 @@ export class PublicSearchProvider implements WebSearchProvider {
       )
       return signal?.aborted ? ({ kind: 'canceled' as const, message: 'aborted by caller' }) : outcome
     })
-    return Effect.runPromise(Effect.scoped(program.pipe(Effect.timeout(timeoutMs))), {
+    const facade = Effect.runPromise(Effect.scoped(program.pipe(Effect.timeout(timeoutMs))), {
       scheduler: syncScheduler,
     }).catch((error: unknown) => {
-      if (Cause.isTimeoutError(error)) return { kind: 'timedOut' as const }
+      if (Cause.isTimeoutError(error)) return { kind: 'timedOut' as const, timeoutMs }
       throw error
+    })
+    return facade.finally(() => {
+      if (!rawStarted) releaseSlot()
     })
   }
 }

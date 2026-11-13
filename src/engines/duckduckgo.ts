@@ -58,6 +58,7 @@ export function localeToKl(lang: string | undefined): string | undefined {
 /** A `WebSearchSource` may use `title`/optional fields; built via guarded assignment. */
 export class DuckDuckGoEngine implements PublicEngine {
   readonly id: PublicEngineId = 'duckduckgo'
+  readonly querySyntax = DUCKDUCKGO_QUERY_SYNTAX
 
   constructor(private readonly userAgent: string) {}
 

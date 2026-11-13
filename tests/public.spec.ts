@@ -19,6 +19,7 @@ import * as publicPlugin from '../src/index.ts'
 import { PUBLIC_PROVIDER_ID, PublicSearchProvider } from '../src/provider.ts'
 import { EngineSearchFailure, type PublicEngine, type PublicEngineId } from '../src/types.ts'
 import { createEngines } from '../src/engines/index.ts'
+import { GOOGLE_QUERY_SYNTAX, MOJEEK_QUERY_SYNTAX } from '../src/query.ts'
 import { enginePages, queryEchoPage, SEARCH_SOURCE } from './search-pages.ts'
 
 const startpageHome = [
@@ -262,11 +263,15 @@ describe('PublicSearchProvider', () => {
     })
   })
 
-  it('tolerates individual engine failures and returns the surviving results', async () => {
+  it('reports individual engine failures alongside surviving results', async () => {
     const blocked = stubEngine('startpage', { error: new Error('HTTP 403') })
     const healthy = stubEngine('duckduckgo', { sources: [{ url: 'https://d.test/3', title: 'Alpha' }] })
     const result = await provider([blocked.engine, healthy.engine]).search({ query: 'q' })
-    expect(result.sources).toEqual([{ url: 'https://d.test/3', title: 'Alpha' }])
+    expect(result).toEqual({
+      notices: ['search coverage was degraded (startpage: HTTP 403)'],
+      sources: [{ url: 'https://d.test/3', title: 'Alpha' }],
+      truncated: false,
+    })
   })
 
   it('waits past the soft deadline for the first success instead of returning empty', async () => {
@@ -533,7 +538,7 @@ describe('PublicSearchProvider', () => {
     expect(blocked.calls).toHaveLength(2)
   })
 
-  it('counts engines still in flight at the hard deadline as failed', async () => {
+  it('clamps engine timeouts to the aggregate hard deadline', async () => {
     const first: PublicEngine = {
       id: 'startpage',
       async search(): Promise<WebSearchSource[]> {
@@ -546,12 +551,13 @@ describe('PublicSearchProvider', () => {
         return new Promise(() => {})
       },
     }
-    await expect(provider([first, second], { softDeadlineMs: 10, hardDeadlineMs: 40 }).search({ query: 'q' }))
-      .rejects.toMatchObject({
-        code: 'WEB_PROVIDER_ERROR',
-        message:
-          'all public search engines failed: startpage: did not settle before the hard deadline; duckduckgo: did not settle before the hard deadline',
-      })
+    const error = await provider([first, second], { softDeadlineMs: 10, hardDeadlineMs: 40 })
+      .search({ query: 'q' })
+      .catch((cause: unknown) => cause) as { code?: string; message?: string }
+    expect(error.code).toBe('WEB_PROVIDER_ERROR')
+    expect(error.message).toContain('startpage:')
+    expect(error.message).toContain('duckduckgo:')
+    expect(error.message).toMatch(/timed out after|did not settle before the hard deadline/)
   })
 
   it('spends the aggregate deadline across retries instead of restarting it', async () => {
@@ -709,34 +715,104 @@ describe('PublicSearchProvider', () => {
     }
   })
 
-  it('fails a queued search past the hard deadline without contacting the engine', async () => {
+  it('uses the remaining aggregate budget after a queue wait', async () => {
     const gates: Array<() => void> = []
+    let calls = 0
     const engine: PublicEngine = {
       id: 'mojeek',
-      async search(_request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchSource[]> {
-        await new Promise<void>((resolve, reject) => {
-          gates.push(resolve)
-          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
-        })
-        return []
+      async search(): Promise<WebSearchSource[]> {
+        calls += 1
+        await new Promise<void>(resolve => gates.push(resolve))
+        return [{ url: `https://ok.test/${calls}` }]
       },
     }
-    const subject = provider([engine], { hardDeadlineMs: 100, timeoutMs: 5_000 })
+    const subject = provider([engine], {
+      timeoutMs: 200,
+      softDeadlineMs: 100,
+      hardDeadlineMs: 200,
+      failureCooldownMs: 0,
+      engineBackoffMs: 0,
+    })
     try {
-      const first = subject.search({ query: 'q1' }).catch((error: unknown) => error)
+      const first = subject.search({ query: 'q1' })
+      const second = subject.search({ query: 'q2' })
       await new Promise(resolve => setTimeout(resolve, 10))
-      const queued = subject.search({ query: 'q2' }).catch((error: unknown) => error)
-
-      const firstError = await first as { code?: string }
-      expect(firstError.code).toBe('WEB_PROVIDER_ERROR')
-      const queuedError = await queued as { message?: string }
-      expect(queuedError.message)
-        .toContain('mojeek: queued for a concurrency slot past the hard deadline')
-      expect(gates).toHaveLength(1)
+      expect(calls).toBe(1)
+      gates.shift()!()
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(calls).toBe(2)
+      gates.shift()!()
+      await expect(Promise.all([first, second])).resolves.toHaveLength(2)
     } finally {
+      for (const release of gates) release()
       await subject.dispose()
     }
   })
+
+  it('holds a concurrency slot until the timed-out raw operation settles', async () => {
+    const gates: Array<() => void> = []
+    let calls = 0
+    const engine: PublicEngine = {
+      id: 'mojeek',
+      async search(): Promise<WebSearchSource[]> {
+        calls += 1
+        await new Promise<void>(resolve => gates.push(resolve))
+        return [{ url: `https://ok.test/${calls}` }]
+      },
+    }
+    const subject = provider([engine], {
+      timeoutMs: 20,
+      softDeadlineMs: 10,
+      hardDeadlineMs: 200,
+      failureCooldownMs: 0,
+      engineBackoffMs: 0,
+    })
+    try {
+      await expect(subject.search({ query: 'q1' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      const second = subject.search({ query: 'q2' })
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(calls).toBe(1)
+      gates.shift()!()
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(calls).toBe(2)
+      gates.shift()!()
+      await expect(second).resolves.toMatchObject({ sources: [{ url: 'https://ok.test/2' }] })
+    } finally {
+      for (const release of gates) release()
+      await subject.dispose()
+    }
+  })
+
+  it('skips engines that cannot enforce strict body or date constraints', async () => {
+    let incapableCalls = 0
+    const incapable: PublicEngine = {
+      id: 'mojeek',
+      querySyntax: MOJEEK_QUERY_SYNTAX,
+      async search(): Promise<WebSearchSource[]> {
+        incapableCalls += 1
+        return [{ url: 'https://wrong.test/' }]
+      },
+    }
+    const capable: PublicEngine = {
+      id: 'google',
+      querySyntax: GOOGLE_QUERY_SYNTAX,
+      async search(): Promise<WebSearchSource[]> {
+        return [{ url: 'https://ok.test/', title: 'Current guide', publishedAt: '2026-02-01' }]
+      },
+    }
+    const result = await provider([incapable, capable]).search({
+      query: 'guide -intext:deprecated after:2026-01-01',
+    })
+    expect(incapableCalls).toBe(0)
+    expect(result).toEqual({
+      notices: [
+        'search coverage was degraded (mojeek: skipped (cannot enforce -intext:deprecated, after:2026-01-01))',
+      ],
+      sources: [{ url: 'https://ok.test/', title: 'Current guide', publishedAt: '2026-02-01' }],
+      truncated: false,
+    })
+  })
+
 
   it('cancels a queued search when its request aborts', async () => {
     const gates: Array<() => void> = []
@@ -1160,6 +1236,38 @@ describe('plugin boot', () => {
     try {
       await expect(ctx.web.search({ query: 'example' })).resolves.toMatchObject({
         sources: [{ url: 'https://browser.test/late', title: 'Mounted Late' }],
+      })
+    } finally {
+      await fiber.dispose()
+      await browserFiber.dispose()
+    }
+  })
+
+  it('rejects an incompatible browser scraper response at the live service boundary', async () => {
+    class InvalidBrowserProbe extends Service {
+      constructor(ctx: Context) {
+        super(ctx, 'browser')
+      }
+
+      async fetchPageHtml(): Promise<{ html: number; status: string; url: null }> {
+        return { html: 42, status: 'ok', url: null }
+      }
+    }
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('blocked', { status: 403 })))
+    const ctx = new Context()
+    await ctx.plugin(WebRuntime, { searchProvider: PUBLIC_PROVIDER_ID })
+    const fiber = await ctx.plugin(publicPlugin, {
+      engines: ['google'],
+      softDeadlineMs: 50,
+      hardDeadlineMs: 500,
+      maxRetries: 0,
+    })
+    const browserFiber = await ctx.plugin(InvalidBrowserProbe)
+    try {
+      await expect(ctx.web.search({ query: 'example' })).rejects.toMatchObject({
+        code: 'WEB_PROVIDER_ERROR',
+        message: expect.stringContaining('browser escalation returned an invalid page'),
       })
     } finally {
       await fiber.dispose()
