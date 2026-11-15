@@ -82,7 +82,7 @@ change and record what you observed.
    unless `relaxPositiveConstraints: true`; negative filters are always strict. Unsupported
    Boolean combinations are forwarded verbatim. Engines that cannot enforce body-text or
    absolute-date constraints are skipped rather than returning unverified matches.
-7. **Notices or recency are absent from a model tool call on Harness 0.2.2-rc.1** → that
+7. **Notices or recency are absent from a model tool call on Harness 0.2.2-rc.3** → that
    published `dsh-tool-web` does not render notices or expose recency. Programmatic `ctx.web`
    calls retain both; use `after:`/`before:` query operators for model calls on that release.
 8. **Want the DeepSeek route** → set `web.searchProvider: deepseek-official` and provide

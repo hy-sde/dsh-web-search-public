@@ -39,13 +39,13 @@ never pin a search to the tool budget.
 ## Prerequisites
 
 - Node.js 22.19 or newer with npm and pnpm on `PATH`;
-- DeepSeek Harness `0.2.2-rc.1` including the standard `dsh` CLI;
+- DeepSeek Harness `0.2.2-rc.3` including the standard `dsh` CLI;
 - no API keys.
 
 Install the Harness CLI and pnpm before continuing:
 
 ```bash
-npm install --global @deepseek-ai/dsh@0.2.2-rc.1 pnpm
+npm install --global @deepseek-ai/dsh@0.2.2-rc.3 pnpm
 dsh --version
 ```
 
@@ -162,7 +162,7 @@ fetch provider and `tool-web` row.
   positive dimension that would erase every result to be relaxed with a notice.
 - A seam caller may pass `recency: day|week|month|year`; this maps to Startpage `with_date`,
   DuckDuckGo `df`, Google `tbs`, and Mojeek `since`. Ecosia ignores recency rather than
-  changing topic or ranking mode. The published `dsh-tool-web@0.2.2-rc.1` does not expose a
+  changing topic or ranking mode. The published `dsh-tool-web@0.2.2-rc.3` does not expose a
   model-facing recency parameter; use `after:`/`before:` operators on that release.
 - Each admitted engine attempt uses the smaller of `timeoutMs` and its remaining aggregate
   budget. A concurrency slot remains occupied until the raw engine operation settles, even
@@ -288,11 +288,11 @@ same `WEB_PROVIDER_ERROR` with `public search engines are rate limited (…); re
 | Component | Supported contract |
 | --- | --- |
 | Node.js | 22.19 or newer |
-| DeepSeek Harness | `0.2.2-rc.1` (`@deepseek-ai/dsh-web ^0.2.2-rc.1`, `@deepseek-ai/cordis ~4.1.0`) |
+| DeepSeek Harness | `0.2.2-rc.3` (`@deepseek-ai/dsh-web ^0.2.2-rc.3`, `@deepseek-ai/cordis ~4.1.0`) |
 | Seam | `ctx.web` `WebSearchProvider` (no API key, no fetch provider) |
 
 The provider implements only `WebSearchProvider`; `@deepseek-ai/dsh-tool-web` owns the
-model-facing tool. The published `dsh-tool-web@0.2.2-rc.1` forwards query and result count but
+model-facing tool. The published `dsh-tool-web@0.2.2-rc.3` forwards query and result count but
 does not forward `recency` or render `WebSearchResult.notices`. Programmatic `ctx.web` callers
 still receive both fields. Harness builds whose tool supports these fields expose them to the
 model without a plugin change.

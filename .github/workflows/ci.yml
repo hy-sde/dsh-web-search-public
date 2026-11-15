@@ -40,5 +40,5 @@ jobs:
       - run: npm pack
       # Smoke the PACKED artifact against the published stock CLI in an
       # isolated DSH_HOME: activation, provider selection, unload/reload.
-      - run: npm install -g @deepseek-ai/dsh@0.2.2-rc.1
+      - run: npm install -g @deepseek-ai/dsh@0.2.2-rc.3
       - run: ./scripts/smoke-installed.sh
